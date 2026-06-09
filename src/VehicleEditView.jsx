@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import VinDecoderSection from './components/VinDecoderSection.jsx';
 import {
   ArrowLeft, Calendar, Fuel, Settings, Save, DollarSign,
   IdCard, Maximize2, ChevronLeft, ChevronRight, ChevronDown,
@@ -198,13 +199,28 @@ export default function VehicleEditView({
   const isSold = vehicle?.status === 'sold';
   const isQuoted = vehicle?.status === 'quoted' || vehicle?.estado === 'Cotizado';
 
+  const mapVehicleFields = (v) => ({
+    ...v,
+    year: v?.anio || v?.year || v?.detalles?.year || '',
+    make: v?.marca || v?.make || v?.detalles?.make || '',
+    model: v?.modelo || v?.model || v?.detalles?.model || '',
+    edition: v?.edicion || v?.edition || v?.detalles?.edition || '',
+    type: v?.tipo_vehiculo || v?.type || v?.detalles?.type || '',
+    color: v?.color || v?.exteriorColor || v?.detalles?.color || '',
+    mileage: v?.millas || v?.mileage || v?.detalles?.mileage || 0,
+    plate: v?.placa || v?.plate || v?.detalles?.plate || '',
+    vin: v?.chasis_vin || v?.vin || v?.detalles?.vin || '',
+    chassis: v?.chasis_vin || v?.chassis || v?.detalles?.chassis || '',
+
+    images: v?.images || (v?.image ? [v.image] : []),
+    photos: v?.photos || [],
+    documents: v?.documents || [],
+    price_unified: (v?.precio > 0 ? v?.precio : (v?.price_dop > 0 ? v.price_dop : (v?.price || 0))).toString(),
+    initial_unified: (v?.inicial > 0 ? v?.inicial : (v?.initial_payment_dop > 0 ? v.initial_payment_dop : (v?.initial_payment || 0))).toString(),
+  });
+
   const [formData, setFormData] = useState({
-    ...vehicle,
-    images: vehicle?.images || (vehicle?.image ? [vehicle.image] : []),
-    photos: vehicle?.photos || [],
-    documents: vehicle?.documents || [],
-    price_unified: (vehicle?.price_dop > 0 ? vehicle.price_dop : (vehicle?.price || 0)).toString(),
-    initial_unified: (vehicle?.initial_payment_dop > 0 ? vehicle.initial_payment_dop : (vehicle?.initial_payment || 0)).toString(),
+    ...mapVehicleFields(vehicle),
 
     // Defaults for selects
     transmission: vehicle?.transmission || vehicle?.transmision || '-',
@@ -220,30 +236,30 @@ export default function VehicleEditView({
     key_type: vehicle?.key_type || '-',
     seats: vehicle?.seats || vehicle?.cantidad_asientos || '-',
     asientos: vehicle?.asientos || vehicle?.cantidad_asientos || vehicle?.seats || '-',
-    condition: vehicle?.condition || '-',
+    condition: vehicle?.condicion || vehicle?.condition || '-',
+    condicion: vehicle?.condicion || vehicle?.condition || '-',
+    clean_carfax: vehicle?.clean_carfax || vehicle?.condicion_carfax || vehicle?.carfaxCondition || vehicle?.detalles?.clean_carfax || '-',
 
     // Convert boolean flags to "Sí" / "No" / "-" for the dropdowns
+    // ONLY map to "No" if it is explicitly the string 'No' in detalles or at the top level
     carplay: (vehicle?.appleCarplay === true || vehicle?.carplay === true || vehicle?.carplay === 'Sí' || vehicle?.apple_android === 'Sí') ? 'Sí' :
-      (vehicle?.appleCarplay === false || vehicle?.carplay === false || vehicle?.carplay === 'No' || vehicle?.apple_android === 'No') ? 'No' : '-',
+      (vehicle?.carplay === 'No' || vehicle?.apple_android === 'No' || vehicle?.detalles?.carplay === 'No' || vehicle?.detalles?.appleCarplay === 'No') ? 'No' : '-',
     sensors: (vehicle?.sensores === true || vehicle?.sensores === 'Sí' || vehicle?.sensors === true || vehicle?.sensors === 'Sí') ? 'Sí' :
-      (vehicle?.sensores === false || vehicle?.sensores === 'No' || vehicle?.sensors === false || vehicle?.sensors === 'No') ? 'No' : '-',
+      (vehicle?.sensores === 'No' || vehicle?.sensors === 'No' || vehicle?.detalles?.sensors === 'No' || vehicle?.detalles?.sensores === 'No') ? 'No' : '-',
     trunk: (vehicle?.powerTrunk === true || vehicle?.baul_electrico === true || vehicle?.baul_electrico === 'Sí' || vehicle?.trunk === 'Sí' || vehicle?.baul === 'Sí') ? 'Sí' :
-      (vehicle?.powerTrunk === false || vehicle?.baul_electrico === false || vehicle?.baul_electrico === 'No' || vehicle?.trunk === 'No' || vehicle?.baul === 'No') ? 'No' : '-',
+      (vehicle?.baul_electrico === 'No' || vehicle?.trunk === 'No' || vehicle?.baul === 'No' || vehicle?.detalles?.powerTrunk === 'No' || vehicle?.detalles?.trunk === 'No' || vehicle?.detalles?.baul_electrico === 'No') ? 'No' : '-',
     camera: (vehicle?.camera === true || vehicle?.camera === 'Sí' || vehicle?.camara === true || vehicle?.camara === 'Sí') ? 'Reversa' :
-      (vehicle?.camera === false || vehicle?.camera === 'No' || vehicle?.camara === false || vehicle?.camara === 'No') ? 'No' :
+      (vehicle?.camera === 'No' || vehicle?.camara === 'No' || vehicle?.detalles?.camera === 'No' || vehicle?.detalles?.camara === 'No') ? 'No' :
         (vehicle?.camera || vehicle?.camara || '-'),
     electric_windows: (vehicle?.powerWindows === true || vehicle?.vidrios_electricos === true || vehicle?.vidrios_electricos === 'Sí' || vehicle?.electric_windows === 'Sí' || vehicle?.vidrios === 'Sí') ? 'Sí' :
-      (vehicle?.powerWindows === false || vehicle?.vidrios_electricos === false || vehicle?.vidrios_electricos === 'No' || vehicle?.electric_windows === 'No' || vehicle?.vidrios === 'No') ? 'No' : '-'
+      (vehicle?.vidrios_electricos === 'No' || vehicle?.electric_windows === 'No' || vehicle?.vidrios === 'No' || vehicle?.detalles?.powerWindows === 'No' || vehicle?.detalles?.electric_windows === 'No' || vehicle?.detalles?.vidrios_electricos === 'No') ? 'No' : '-'
   });
 
   useEffect(() => {
     if (vehicle) {
       setFormData(prev => ({
         ...prev,
-        ...vehicle,
-        images: vehicle?.images || (vehicle?.image ? [vehicle.image] : []),
-        price_unified: (vehicle?.price_dop > 0 ? vehicle.price_dop : (vehicle?.price || 0)).toString(),
-        initial_unified: (vehicle?.initial_payment_dop > 0 ? vehicle.initial_payment_dop : (vehicle?.initial_payment || 0)).toString(),
+        ...mapVehicleFields(vehicle),
 
         // Defaults for selects
         transmission: vehicle?.transmission || vehicle?.transmision || '-',
@@ -259,26 +275,29 @@ export default function VehicleEditView({
         key_type: vehicle?.key_type || '-',
         seats: vehicle?.seats || vehicle?.cantidad_asientos || '-',
         asientos: vehicle?.asientos || vehicle?.cantidad_asientos || vehicle?.seats || '-',
-        condition: vehicle?.condition || '-',
+        condition: vehicle?.condicion || vehicle?.condition || '-',
+        condicion: vehicle?.condicion || vehicle?.condition || '-',
+        clean_carfax: vehicle?.clean_carfax || vehicle?.condicion_carfax || vehicle?.carfaxCondition || vehicle?.detalles?.clean_carfax || '-',
 
         // Convert boolean flags to "Sí" / "No" / "-" for the dropdowns
+        // ONLY map to "No" if it is explicitly the string 'No' in detalles or at the top level
         carplay: (vehicle?.appleCarplay === true || vehicle?.carplay === true || vehicle?.carplay === 'Sí' || vehicle?.apple_android === 'Sí') ? 'Sí' :
-          (vehicle?.appleCarplay === false || vehicle?.carplay === false || vehicle?.carplay === 'No' || vehicle?.apple_android === 'No') ? 'No' : '-',
+          (vehicle?.carplay === 'No' || vehicle?.apple_android === 'No' || vehicle?.detalles?.carplay === 'No' || vehicle?.detalles?.appleCarplay === 'No') ? 'No' : '-',
         sensors: (vehicle?.sensores === true || vehicle?.sensores === 'Sí' || vehicle?.sensors === true || vehicle?.sensors === 'Sí') ? 'Sí' :
-          (vehicle?.sensores === false || vehicle?.sensores === 'No' || vehicle?.sensors === false || vehicle?.sensors === 'No') ? 'No' : '-',
+          (vehicle?.sensores === 'No' || vehicle?.sensors === 'No' || vehicle?.detalles?.sensors === 'No' || vehicle?.detalles?.sensores === 'No') ? 'No' : '-',
         trunk: (vehicle?.powerTrunk === true || vehicle?.baul_electrico === true || vehicle?.baul_electrico === 'Sí' || vehicle?.trunk === 'Sí' || vehicle?.baul === 'Sí') ? 'Sí' :
-          (vehicle?.powerTrunk === false || vehicle?.baul_electrico === false || vehicle?.baul_electrico === 'No' || vehicle?.trunk === 'No' || vehicle?.baul === 'No') ? 'No' : '-',
+          (vehicle?.baul_electrico === 'No' || vehicle?.trunk === 'No' || vehicle?.baul === 'No' || vehicle?.detalles?.powerTrunk === 'No' || vehicle?.detalles?.trunk === 'No' || vehicle?.detalles?.baul_electrico === 'No') ? 'No' : '-',
         camera: (vehicle?.camera === true || vehicle?.camera === 'Sí' || vehicle?.camara === true || vehicle?.camara === 'Sí') ? 'Reversa' :
-          (vehicle?.camera === false || vehicle?.camera === 'No' || vehicle?.camara === false || vehicle?.camara === 'No') ? 'No' :
+          (vehicle?.camera === 'No' || vehicle?.camara === 'No' || vehicle?.detalles?.camera === 'No' || vehicle?.detalles?.camara === 'No') ? 'No' :
             (vehicle?.camera || vehicle?.camara || '-'),
         electric_windows: (vehicle?.powerWindows === true || vehicle?.vidrios_electricos === true || vehicle?.vidrios_electricos === 'Sí' || vehicle?.electric_windows === 'Sí' || vehicle?.vidrios === 'Sí') ? 'Sí' :
-          (vehicle?.powerWindows === false || vehicle?.vidrios_electricos === false || vehicle?.vidrios_electricos === 'No' || vehicle?.electric_windows === 'No' || vehicle?.vidrios === 'No') ? 'No' : '-'
+          (vehicle?.vidrios_electricos === 'No' || vehicle?.electric_windows === 'No' || vehicle?.vidrios === 'No' || vehicle?.detalles?.powerWindows === 'No' || vehicle?.detalles?.electric_windows === 'No' || vehicle?.detalles?.vidrios_electricos === 'No') ? 'No' : '-'
       }));
-      setCurrency(vehicle.currency || (vehicle.price_dop > 0 ? 'DOP' : 'USD'));
-      setDownPaymentCurrency(vehicle.downPaymentCurrency || (vehicle.initial_payment_dop > 0 ? 'DOP' : 'USD'));
-      setMileageUnit(vehicle.mileage_unit || 'MI');
+      setCurrency(vehicle.moneda_precio || vehicle.currency || vehicle.detalles?.currency || (vehicle.precio > 0 ? 'USD' : (vehicle.price_dop > 0 ? 'DOP' : 'USD')));
+      setDownPaymentCurrency(vehicle.moneda_inicial || vehicle.downPaymentCurrency || vehicle.detalles?.downPaymentCurrency || (vehicle.initial_payment_dop > 0 ? 'DOP' : 'USD'));
+      setMileageUnit(vehicle.unit || vehicle.mileage_unit || 'MI');
     }
-    if (mileageRef.current) mileageRef.current.value = vehicle.mileage || 0;
+    if (mileageRef.current) mileageRef.current.value = vehicle.millas || vehicle.mileage || 0;
   }, [vehicle?.id]);
 
   if (!vehicle) return null;
@@ -1209,6 +1228,16 @@ export default function VehicleEditView({
 
             {/* 4. SAVE BUTTON AT BOTTOM */}
           </div>
+        </div>
+
+        {/* VIN DECODER */}
+        <div className="xl:col-span-12 -mt-2">
+          <VinDecoderSection
+            existingData={formData}
+            onApply={(fields) => {
+              setFormData(prev => ({ ...prev, ...fields }));
+            }}
+          />
         </div>
 
         {/* FULL WIDTH BOTTOM: FICHA TÉCNICA */}

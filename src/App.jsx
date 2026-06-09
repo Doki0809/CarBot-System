@@ -35,6 +35,8 @@ import {
   Phone, Mail, RefreshCw, Users, MessageCircle, UploadCloud, FileSpreadsheet, Table2
 } from 'lucide-react';
 import VehicleEditView from './VehicleEditView';
+import VinDecoderSection from './components/VinDecoderSection.jsx';
+import { mapVinToFormFields } from './utils/vinDecoder.js';
 import ContactsView from './ContactsView';
 import ConversationsView from './ConversationsView';
 import { generarContratoEnGHL } from './ghl_integration/ghlService';
@@ -340,6 +342,43 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
   const [mileageValue, setMileageValue] = useState(String(initialData?.mileage ?? ''));
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [status, setStatus] = useState(initialData?.status || 'available');
+  const formRef = useRef(null);
+  // Controlled values for selects filled by VIN decoder
+  const [vinSelects, setVinSelects] = useState({});
+
+  // Text inputs that can be filled by VIN decoder via DOM
+  const VIN_TEXT_INPUTS = ['make', 'model', 'year', 'edition', 'vin', 'engine_cyl', 'engine_cc'];
+  // Select inputs managed via state
+  const VIN_SELECT_INPUTS = ['type', 'fuel', 'transmission', 'traction', 'engine_type', 'camera', 'key_type', 'seats'];
+
+  const applyVinToForm = (fields) => {
+    const form = formRef.current;
+    const newSelects = {};
+
+    Object.entries(fields).forEach(([key, val]) => {
+      if (!val) return;
+
+      if (VIN_SELECT_INPUTS.includes(key)) {
+        // Only fill if not already set by user
+        if (!vinSelects[key] || vinSelects[key] === '-') {
+          newSelects[key] = val;
+        }
+        return;
+      }
+
+      // Text inputs: set via DOM
+      if (form && VIN_TEXT_INPUTS.includes(key)) {
+        const el = form.elements[key];
+        if (!el) return;
+        if (el.value && el.value !== '' && el.value !== '-') return;
+        el.value = val;
+      }
+    });
+
+    if (Object.keys(newSelects).length > 0) {
+      setVinSelects(prev => ({ ...prev, ...newSelects }));
+    }
+  };
 
   const formatWithCommas = (value) => {
     if (!value && value !== 0) return '';
@@ -628,7 +667,15 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
 
         {/* SCROLLABLE FORM */}
         <div className="flex-1 overflow-y-auto bg-white">
-          <form id="vehicle-main-form" onSubmit={handleSubmit} className="p-8 max-w-5xl mx-auto space-y-10">
+          <form id="vehicle-main-form" ref={formRef} onSubmit={handleSubmit} className="p-8 max-w-5xl mx-auto space-y-10">
+
+            {/* VIN DECODER */}
+            {!isLocked && (
+              <VinDecoderSection
+                existingData={{}}
+                onApply={(fields) => applyVinToForm(fields)}
+              />
+            )}
 
             {/* DATOS PRINCIPALES */}
             <div className={isLocked ? "opacity-60 pointer-events-none grayscale-[0.5] transition-all" : "transition-all"}>
@@ -703,22 +750,42 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
             </div>
 
             {/* FICHA TÉCNICA */}
-            <div className={`bg-slate-50/50 rounded-3xl p-6 border border-slate-100 ${isLocked ? "opacity-60 pointer-events-none grayscale-[0.5]" : ""}`}>
+            <div className={`rounded-3xl p-6 ${isLocked ? "opacity-60 pointer-events-none grayscale-[0.5]" : ""}`} style={{ backgroundColor: 'var(--bg-elevated)', border: '1px solid var(--border-glass)' }}>
               <SectionHeader title="Ficha Técnica y Accesorios" icon={Settings} />
 
               <div className="grid grid-cols-1 md:grid-cols-3 gap-x-8 gap-y-6">
                 {/* FILA 1 */}
                 <Select name="condition" label="Condición" defaultValue={initialData?.condition || '-'} options={['-', 'Usado', 'Recién Importado', 'Nuevo', 'Certificado']} disabled={isLocked} />
                 <Select name="clean_carfax" label="Clean Carfax" defaultValue={initialData?.clean_carfax || '-'} options={['-', 'Sí', 'No']} disabled={isLocked} />
-                <Select name="type" label="Tipo de Vehículo" defaultValue={initialData?.type || initialData?.bodyType || initialData?.tipo_vehiculo || '-'} options={['-', 'Automóvil', 'Jeepeta', 'Camioneta', 'Moto', 'Camión', 'Bus', 'Vehículos Pesados']} disabled={isLocked} />
+                <Select name="type" label="Tipo de Vehículo"
+                  value={vinSelects.type || undefined}
+                  defaultValue={initialData?.type || initialData?.bodyType || initialData?.tipo_vehiculo || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, type: e.target.value }))}
+                  options={['-', 'Automóvil', 'Jeepeta', 'Camioneta', 'Moto', 'Camión', 'Bus', 'Vehículos Pesados']} disabled={isLocked} />
 
                 {/* FILA 2 */}
-                <Select name="transmission" label="Transmisión" defaultValue={initialData?.transmission || '-'} options={['-', 'Automática', 'Manual', 'CVT', 'Tiptronic', 'DSG']} disabled={isLocked} />
-                <Select name="fuel" label="Combustible" defaultValue={initialData?.fuel || '-'} options={['-', 'Gasolina', 'Diesel', 'Híbrido', 'Eléctrico', 'GLP']} disabled={isLocked} />
-                <Select name="traction" label="Tracción" defaultValue={initialData?.traction || '-'} options={['-', 'FWD', 'RWD', 'AWD', '4x4']} disabled={isLocked} />
+                <Select name="transmission" label="Transmisión"
+                  value={vinSelects.transmission || undefined}
+                  defaultValue={initialData?.transmission || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, transmission: e.target.value }))}
+                  options={['-', 'Automática', 'Manual', 'CVT', 'Tiptronic', 'DSG']} disabled={isLocked} />
+                <Select name="fuel" label="Combustible"
+                  value={vinSelects.fuel || undefined}
+                  defaultValue={initialData?.fuel || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, fuel: e.target.value }))}
+                  options={['-', 'Gasolina', 'Diesel', 'Híbrido', 'Eléctrico', 'GLP']} disabled={isLocked} />
+                <Select name="traction" label="Tracción"
+                  value={vinSelects.traction || undefined}
+                  defaultValue={initialData?.traction || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, traction: e.target.value }))}
+                  options={['-', 'FWD', 'RWD', 'AWD', '4x4']} disabled={isLocked} />
 
                 {/* FILA 3 */}
-                <Select name="engine_type" label="Aspiración/Tipo" defaultValue={initialData?.engine_type || '-'} options={['-', 'Normal', 'Turbo', 'Supercharged', 'Híbrido', 'Eléctrico']} disabled={isLocked} />
+                <Select name="engine_type" label="Aspiración/Tipo"
+                  value={vinSelects.engine_type || undefined}
+                  defaultValue={initialData?.engine_type || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, engine_type: e.target.value }))}
+                  options={['-', 'Normal', 'Turbo', 'Supercharged', 'Híbrido', 'Eléctrico']} disabled={isLocked} />
                 <Input name="engine_cyl" label="Cilindros" defaultValue={initialData?.engine_cyl} placeholder="4 Cil" disabled={isLocked} />
                 <Input name="engine_cc" label="Cilindrada" defaultValue={initialData?.engine_cc} placeholder="2.0L" disabled={isLocked} />
                 <Select
@@ -734,7 +801,11 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                 <Select name="roof_type" label="Techo" defaultValue={initialData?.roof_type || '-'} options={['-', 'Normal', 'Panorámico', 'Sunroof', 'Convertible', 'Targa']} disabled={isLocked} />
 
                 {/* EXTRAS */}
-                <Select name="camera" label="Cámara" defaultValue={initialData?.camera || '-'} options={['-', 'No', 'Reversa', '360°', 'Frontal + Reversa']} disabled={isLocked} />
+                <Select name="camera" label="Cámara"
+                  value={vinSelects.camera || undefined}
+                  defaultValue={initialData?.camera || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, camera: e.target.value }))}
+                  options={['-', 'No', 'Reversa', '360°', 'Frontal + Reversa']} disabled={isLocked} />
                 <Select
                   name="sensors"
                   label="Sensores"
@@ -756,8 +827,16 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                   options={['-', 'Sí', 'No']}
                   disabled={isLocked}
                 />
-                <Select name="key_type" label="Llave" defaultValue={initialData?.key_type || '-'} options={['-', 'Llave Normal', 'Push Button']} disabled={isLocked} />
-                <Select name="seats" label="Filas Asientos" defaultValue={initialData?.seats || '-'} options={['-', '1', '2', '3', '4', '5']} disabled={isLocked} />
+                <Select name="key_type" label="Llave"
+                  value={vinSelects.key_type || undefined}
+                  defaultValue={initialData?.key_type || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, key_type: e.target.value }))}
+                  options={['-', 'Llave Normal', 'Push Button']} disabled={isLocked} />
+                <Select name="seats" label="Filas Asientos"
+                  value={vinSelects.seats || undefined}
+                  defaultValue={initialData?.seats || '-'}
+                  onChange={(e) => setVinSelects(prev => ({ ...prev, seats: e.target.value }))}
+                  options={['-', '1', '2', '3', '4', '5']} disabled={isLocked} />
               </div>
             </div>
 
@@ -3662,7 +3741,7 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
         const dealerName = userProfile?.dealerName || 'default';
         let s = dealerName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\./g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
         const normalized = dealerName.toUpperCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-        if (normalized.includes('DURAN') && normalized.includes('FERNANDEZ')) s = 'dura-n-ferna-ndez-auto-srl';
+        if (normalized.includes('DURAN') && normalized.includes('FERNANDEZ')) s = 'duran-fernandez-auto-srl';
         const linkJson = `https://carbotsystem.com/inventario/${s}/bot`;
         navigator.clipboard.writeText(linkJson);
         showToast(t('toast_link_copied_bot'));
@@ -3679,8 +3758,9 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
         if (!!userProfile?.ghlLocationId) {
           if (onDisconnectGhl) onDisconnectGhl();
         } else {
-          const authUrl = `https://marketplace.leadconnectorhq.com/oauth/chooselocation?response_type=code&redirect_uri=https%3A%2F%2Flpiwkennlavpzisdvnnh.supabase.co%2Ffunctions%2Fv1%2Foauth-callback&client_id=699b6f13fb99957c718a1e38-mma1agkx&scope=contacts.readonly+contacts.write+documents_contracts%2Flist.readonly+documents_contracts%2FsendLink.write+documents_contracts_template%2Flist.readonly+locations.readonly+users.readonly+documents_contracts_template%2FsendLink.write+locations%2FcustomFields.readonly+locations%2FcustomFields.write+custom-menu-link.readonly+custom-menu-link.write+conversations.readonly+conversations.write+conversations%2Fmessage.readonly+conversations%2Fmessage.write+conversations%2Freports.readonly+conversations%2Flivechat.write+conversation-ai.readonly+conversation-ai.write&version_id=69ab5865c2202af8a273fd40`;
-          window.open(authUrl, '_blank');
+          const dealerUuid = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+          const stateParam = dealerUuid ? `&state=${encodeURIComponent(dealerUuid)}` : '';
+          window.open(`${GHL_INSTALL_URL}${stateParam}`, '_blank');
         }
       }
     },
@@ -3699,6 +3779,22 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
         showToast(t('toast_link_copied_catalog'));
       }
     },
+    ...(() => {
+      const dn = (userProfile?.dealerName || '').toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      if (dn.includes('DURAN') && dn.includes('FERNANDEZ')) {
+        return [{
+          title: 'Cat\u00e1logo Meta',
+          icon: FileSpreadsheet,
+          iconColor: '#1877F2',
+          iconBg: 'rgba(24, 119, 242, 0.12)',
+          action: () => {
+            navigator.clipboard.writeText('https://us-central1-carbot-5d709.cloudfunctions.net/metaFeedDuran');
+            showToast('Link de Cat\u00e1logo Meta copiado');
+          }
+        }];
+      }
+      return [];
+    })(),
   ];
 
   return (
@@ -5798,59 +5894,190 @@ const normalizeStringForId = (str) => {
 };
 
 
-const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect }) => {
+const GHL_INSTALL_URL = `https://marketplace.leadconnectorhq.com/oauth/chooselocation?response_type=code&redirect_uri=https%3A%2F%2Flpiwkennlavpzisdvnnh.supabase.co%2Ffunctions%2Fv1%2Foauth-callback&client_id=699b6f13fb99957c718a1e38-mma1agkx&scope=contacts.readonly+contacts.write+documents_contracts%2Flist.readonly+documents_contracts%2FsendLink.write+documents_contracts_template%2Flist.readonly+locations.readonly+users.readonly+documents_contracts_template%2FsendLink.write+locations%2FcustomFields.readonly+locations%2FcustomFields.write+custom-menu-link.readonly+custom-menu-link.write+conversations.readonly+conversations.write+conversations%2Fmessage.readonly+conversations%2Fmessage.write+conversations%2Freports.readonly+conversations%2Flivechat.write+conversation-ai.readonly+conversation-ai.write&version_id=69ab5865c2202af8a273fd40`;
+
+const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect, isSuperAdmin, onSoftDelete, onRecover, onCreateDealer }) => {
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
   if (!isOpen) return null;
+
+  const now = Date.now();
+  const MS_24H = 24 * 60 * 60 * 1000;
+
+  const getTimeLeft = (deletedAt) => {
+    if (!deletedAt) return null;
+    const remaining = MS_24H - (now - new Date(deletedAt).getTime());
+    if (remaining <= 0) return null;
+    const h = Math.floor(remaining / 3600000);
+    const m = Math.floor((remaining % 3600000) / 60000);
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  };
+
+  const sortedDealers = [...dealers].sort((a, b) => {
+    if (a.deleted_at && !b.deleted_at) return 1;
+    if (!a.deleted_at && b.deleted_at) return -1;
+    return a.nombre.localeCompare(b.nombre);
+  });
+
+  const handleInstallNew = () => {
+    window.open(GHL_INSTALL_URL, '_blank');
+  };
+
   return createPortal(
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.72)', backdropFilter: 'blur(12px)' }}
+    >
       <motion.div
-        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        initial={{ opacity: 0, scale: 0.96, y: 24 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-lg overflow-hidden border border-slate-100"
+        transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+        style={{
+          background: 'linear-gradient(160deg, #1a1d27 0%, #13151e 100%)',
+          border: '1px solid rgba(255,255,255,0.08)',
+          borderRadius: '2rem',
+          boxShadow: '0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04) inset',
+        }}
+        className="w-full max-w-md overflow-hidden"
       >
-        <div className="p-8 border-b border-slate-50 flex justify-between items-center bg-slate-50/50">
-          <div>
-            <h2 className="text-2xl font-black text-slate-800 tracking-tight">Seleccionar Cuenta</h2>
-            <p className="text-slate-500 text-sm font-bold mt-1">Elige el dealer para esta sesión</p>
+        {/* Header */}
+        <div className="relative px-6 pt-6 pb-4 flex items-start justify-between">
+          <div
+            className="absolute inset-0 opacity-30 pointer-events-none"
+            style={{ background: 'radial-gradient(ellipse 60% 50% at 20% 0%, rgba(255,59,48,0.18) 0%, transparent 70%)' }}
+          />
+          <div className="relative">
+            <div className="flex items-center gap-2.5 mb-1">
+              <div className="w-7 h-7 rounded-xl flex items-center justify-center" style={{ background: 'rgba(255,59,48,0.15)', border: '1px solid rgba(255,59,48,0.25)' }}>
+                <Building2 size={14} style={{ color: '#FF3B30' }} />
+              </div>
+              <span className="text-[10px] font-black tracking-[0.18em] uppercase" style={{ color: 'rgba(255,255,255,0.35)' }}>Super Admin</span>
+            </div>
+            <h2 className="text-xl font-black tracking-tight" style={{ color: '#F5F5F7' }}>Seleccionar Cuenta</h2>
+            <p className="text-xs font-medium mt-0.5" style={{ color: 'rgba(255,255,255,0.35)' }}>{sortedDealers.filter(d => !d.deleted_at).length} cuentas activas</p>
           </div>
-          <button onClick={onClose} className="p-3 hover:bg-white rounded-2xl transition-colors text-slate-400">
-            <X size={24} />
+          <button
+            onClick={onClose}
+            className="relative p-2 rounded-xl transition-all duration-200 hover:scale-105 active:scale-95"
+            style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.4)' }}
+          >
+            <X size={18} />
           </button>
         </div>
 
-        <div className="p-4 max-h-[60vh] overflow-y-auto custom-scrollbar">
-          <div className="grid gap-3">
-            {dealers.map((dealer) => (
-              <button
-                key={dealer.id}
-                onClick={() => onSelect(dealer)}
-                className="group flex items-center gap-4 p-4 rounded-3xl border-2 border-transparent hover:border-red-500/20 hover:bg-red-50/30 transition-all text-left active:scale-[0.98]"
-              >
-                <div className="w-14 h-14 rounded-2xl bg-white border border-slate-100 flex items-center justify-center overflow-hidden p-2 shadow-sm group-hover:shadow-md transition-shadow">
-                  {dealer.logo_url ? (
-                    <img src={dealer.logo_url} alt={dealer.nombre} className="max-w-full max-h-full object-contain" />
+        {/* List */}
+        <div className="px-3 pb-2 max-h-[52vh] overflow-y-auto" style={{ scrollbarWidth: 'none' }}>
+          <div className="flex flex-col gap-1.5">
+            {sortedDealers.map((dealer) => {
+              const isPendingDelete = !!dealer.deleted_at;
+              const timeLeft = isPendingDelete ? getTimeLeft(dealer.deleted_at) : null;
+              const isConfirming = confirmDeleteId === dealer.id;
+              const initials = dealer.nombre.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+
+              if (isPendingDelete) {
+                return (
+                  <div key={dealer.id} className="flex items-center gap-3 px-3 py-3 rounded-2xl opacity-40" style={{ background: 'rgba(255,255,255,0.03)' }}>
+                    <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 grayscale" style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                      {dealer.logo_url ? <img src={dealer.logo_url} alt="" className="w-full h-full object-contain rounded-xl p-1" /> : <span className="text-xs font-black text-white/40">{initials}</span>}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-black uppercase line-through truncate" style={{ color: 'rgba(255,255,255,0.3)' }}>{dealer.nombre}</div>
+                      <div className="text-[10px] font-bold mt-0.5" style={{ color: 'rgba(255,255,255,0.2)' }}>{timeLeft ? `Eliminando en ${timeLeft}` : 'Eliminando…'}</div>
+                    </div>
+                    {isSuperAdmin && (
+                      <button onClick={() => onRecover(dealer.id)} className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-black transition-all" style={{ background: 'rgba(52,199,89,0.12)', border: '1px solid rgba(52,199,89,0.2)', color: '#34C759' }}>
+                        <Undo size={12} /> Recuperar
+                      </button>
+                    )}
+                  </div>
+                );
+              }
+
+              return (
+                <div key={dealer.id} className="relative group">
+                  {isConfirming ? (
+                    <div className="flex items-center gap-2.5 px-3 py-3 rounded-2xl" style={{ background: 'rgba(255,59,48,0.08)', border: '1px solid rgba(255,59,48,0.2)' }}>
+                      <AlertTriangle size={16} style={{ color: '#FF3B30' }} className="shrink-0" />
+                      <div className="flex-1 text-xs font-bold" style={{ color: 'rgba(255,59,48,0.9)' }}>
+                        ¿Eliminar <span className="uppercase font-black">{dealer.nombre}</span>? 24h para recuperar.
+                      </div>
+                      <button onClick={() => { onSoftDelete(dealer.id); setConfirmDeleteId(null); }} className="px-2.5 py-1.5 rounded-xl text-xs font-black transition-all hover:opacity-80" style={{ background: '#FF3B30', color: '#fff' }}>Eliminar</button>
+                      <button onClick={() => setConfirmDeleteId(null)} className="px-2.5 py-1.5 rounded-xl text-xs font-black transition-all" style={{ background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.5)' }}>No</button>
+                    </div>
                   ) : (
-                    <Building2 className="text-slate-300" size={28} />
+                    <button
+                      onClick={() => onSelect(dealer)}
+                      className="w-full flex items-center gap-3 px-3 py-3 rounded-2xl transition-all duration-200 text-left active:scale-[0.98] group/btn"
+                      style={{ background: 'rgba(255,255,255,0.0)' }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'rgba(255,255,255,0.0)'}
+                    >
+                      {/* Logo / Avatar */}
+                      <div className="w-11 h-11 rounded-xl shrink-0 flex items-center justify-center overflow-hidden relative" style={{ background: dealer.logo_url ? 'rgba(255,255,255,0.06)' : `hsl(${(dealer.nombre.charCodeAt(0) * 37) % 360}, 50%, 25%)`, border: '1px solid rgba(255,255,255,0.08)' }}>
+                        {dealer.logo_url
+                          ? <img src={dealer.logo_url} alt="" className="w-full h-full object-contain p-1.5" />
+                          : <span className="text-sm font-black" style={{ color: `hsl(${(dealer.nombre.charCodeAt(0) * 37) % 360}, 80%, 75%)` }}>{initials}</span>
+                        }
+                      </div>
+                      {/* Info */}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-black uppercase leading-tight truncate transition-colors duration-200" style={{ color: '#F5F5F7' }}
+                          onMouseEnter={e => e.currentTarget.style.color = '#FF3B30'}
+                          onMouseLeave={e => e.currentTarget.style.color = '#F5F5F7'}
+                        >{dealer.nombre}</div>
+                        <div className="text-[10px] font-bold mt-0.5 tracking-wider uppercase truncate" style={{ color: 'rgba(255,255,255,0.25)' }}>
+                          {dealer.ghl_location_id ? `GHL · ${dealer.id_busqueda || dealer.id.slice(0,8)}` : dealer.id_busqueda || dealer.id.slice(0,8)}
+                        </div>
+                      </div>
+                      {/* GHL badge */}
+                      {dealer.ghl_location_id && (
+                        <div className="shrink-0 w-2 h-2 rounded-full" style={{ background: '#34C759', boxShadow: '0 0 6px rgba(52,199,89,0.6)' }} title="Conectado a GHL" />
+                      )}
+                      {/* Arrow */}
+                      <div className="shrink-0 w-7 h-7 rounded-xl flex items-center justify-center transition-all duration-200" style={{ background: 'rgba(255,255,255,0.05)', color: 'rgba(255,255,255,0.2)' }}>
+                        <ArrowRight size={14} />
+                      </div>
+                    </button>
+                  )}
+                  {isSuperAdmin && !isConfirming && (
+                    <button
+                      onClick={e => { e.stopPropagation(); setConfirmDeleteId(dealer.id); }}
+                      className="absolute right-10 top-1/2 -translate-y-1/2 p-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-all duration-200"
+                      style={{ color: 'rgba(255,255,255,0.25)' }}
+                      onMouseEnter={e => { e.currentTarget.style.color = '#FF3B30'; e.currentTarget.style.background = 'rgba(255,59,48,0.1)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.25)'; e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      <Trash2 size={13} />
+                    </button>
                   )}
                 </div>
-                <div className="flex-1">
-                  <div className="text-slate-800 font-black text-lg group-hover:text-red-600 transition-colors uppercase leading-tight">
-                    {dealer.nombre}
-                  </div>
-                  <div className="text-slate-400 text-xs font-bold mt-1 tracking-wider uppercase">
-                    ID: {dealer.id_busqueda || dealer.id.split('-')[0]}
-                  </div>
-                </div>
-                <div className="w-10 h-10 rounded-full bg-slate-50 flex items-center justify-center text-slate-300 group-hover:bg-red-500 group-hover:text-white transition-all">
-                  <ArrowRight size={20} />
-                </div>
-              </button>
-            ))}
+              );
+            })}
           </div>
         </div>
 
-        <div className="p-6 bg-slate-50/50 border-t border-slate-100">
-          <p className="text-center text-[10px] font-black text-slate-400 uppercase tracking-widest">
-            Acceso de Super Administrador • CarBot System
+        {/* Footer */}
+        <div className="px-4 pb-5 pt-3 space-y-2.5" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+          {isSuperAdmin && (
+            <button
+              onClick={handleInstallNew}
+              className="w-full flex items-center justify-center gap-2.5 py-3 rounded-2xl font-black text-sm transition-all duration-200 active:scale-[0.98] hover:opacity-90"
+              style={{
+                background: 'linear-gradient(135deg, rgba(255,59,48,0.15) 0%, rgba(255,59,48,0.08) 100%)',
+                border: '1px solid rgba(255,59,48,0.3)',
+                color: '#FF6B63',
+                boxShadow: '0 0 20px rgba(255,59,48,0.08) inset',
+              }}
+            >
+              <div className="w-5 h-5 rounded-lg flex items-center justify-center" style={{ background: 'rgba(255,59,48,0.2)' }}>
+                <Plus size={12} style={{ color: '#FF3B30' }} />
+              </div>
+              Instalar en Nueva Subcuenta
+              <ArrowRight size={14} style={{ color: 'rgba(255,107,99,0.6)' }} />
+            </button>
+          )}
+          <p className="text-center text-[9px] font-black uppercase tracking-[0.2em]" style={{ color: 'rgba(255,255,255,0.15)' }}>
+            CarBot System · Super Admin
           </p>
         </div>
       </motion.div>
@@ -6106,6 +6333,7 @@ export default function CarbotApp() {
         setIsLoggedIn(true);
         setCurrentUserEmail(session.user.email);
         localStorage.setItem('lastUserEmail', session.user.email);
+        if (session.user.email.toLowerCase() === 'jeancarlosgf13@gmail.com') setIsSuperAdmin(true);
       } else if (isAutoLogin) {
         const emailToUse = (urlUserEmail || localStorage.getItem('lastUserEmail') || (urlUserId ? `${urlUserId}@ghl.com` : (urlLocationId ? `admin@${urlLocationId}.com` : ''))).toLowerCase();
         if (emailToUse || isStoreRoute) {
@@ -6131,6 +6359,7 @@ export default function CarbotApp() {
       if (session?.user) {
         setIsLoggedIn(true);
         setCurrentUserEmail(session.user.email);
+        if (session.user.email.toLowerCase() === 'jeancarlosgf13@gmail.com') setIsSuperAdmin(true);
       }
       setAuthChecked(true);
       setInitializing(false);
@@ -6138,19 +6367,66 @@ export default function CarbotApp() {
     checkSession();
 
     return () => subscription.unsubscribe();
-  }, [isAutoLogin, urlUserEmail, isStoreRoute, urlLocationId, urlLocationName, authChecked, isLoggedIn]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
 
   // --- 1.c FETCH ALL DEALERS FOR SUPERADMIN ---
-  useEffect(() => {
-    if (isSuperAdmin) {
-      const fetchAllDealers = async () => {
-        const { data } = await supabase.from('dealers').select('*').order('nombre', { ascending: true });
-        if (data) setAllDealers(data);
-      };
-      fetchAllDealers();
-    }
+  const refreshAllDealers = useCallback(async () => {
+    if (!isSuperAdmin) return;
+    // Purge dealers whose 24h window has expired before fetching
+    await supabase
+      .from('dealers')
+      .delete()
+      .not('deleted_at', 'is', null)
+      .lt('deleted_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    const { data } = await supabase.from('dealers').select('*').order('nombre', { ascending: true });
+    if (data) setAllDealers(data);
   }, [isSuperAdmin]);
+
+  useEffect(() => {
+    refreshAllDealers();
+  }, [refreshAllDealers]);
+
+  const handleSoftDeleteDealer = useCallback(async (dealerId) => {
+    const { error } = await supabase
+      .from('dealers')
+      .update({ deleted_at: new Date().toISOString() })
+      .eq('id', dealerId);
+    if (error) {
+      showToast(`Error al eliminar: ${error.message}`, 'error');
+      return;
+    }
+    showToast('Cuenta marcada para eliminación. Tienes 24h para recuperarla.', 'success');
+    await refreshAllDealers();
+  }, [refreshAllDealers]);
+
+  const handleRecoverDealer = useCallback(async (dealerId) => {
+    const { error } = await supabase
+      .from('dealers')
+      .update({ deleted_at: null })
+      .eq('id', dealerId);
+    if (error) {
+      showToast(`Error al recuperar: ${error.message}`, 'error');
+      return;
+    }
+    showToast('Cuenta recuperada.', 'success');
+    await refreshAllDealers();
+  }, [refreshAllDealers]);
+
+  const handleCreateDealer = useCallback(async ({ nombre, ghl_location_id }) => {
+    const id_busqueda = normalizeStringForId(nombre).toUpperCase();
+    const { data, error } = await supabase
+      .from('dealers')
+      .insert({ id: crypto.randomUUID(), nombre, id_busqueda, ghl_location_id: ghl_location_id || null, activo: true })
+      .select('id, nombre')
+      .single();
+    if (error) {
+      showToast(`Error al crear cuenta: ${error.message}`, 'error');
+      return;
+    }
+    showToast(`Cuenta "${data.nombre}" creada.`, 'success');
+    await refreshAllDealers();
+  }, [refreshAllDealers, showToast]);
 
   // --- AUTO-SELECT VEHICLE FROM URL ---
   const autoSelectRan = useRef(false);
@@ -6890,7 +7166,20 @@ export default function CarbotApp() {
       isDestructive: true,
       onConfirm: async () => {
         try {
-          await supabase.auth.signOut();
+          // Guardar refresh token con ventana de 1 hora antes de cerrar sesión localmente
+          const { data: { session: currentSession } } = await supabase.auth.getSession().catch(() => ({ data: { session: null } }));
+          if (currentSession?.refresh_token) {
+            try {
+              const saved = JSON.parse(localStorage.getItem('carbot-last-user') || '{}');
+              localStorage.setItem('carbot-last-user', JSON.stringify({
+                ...saved,
+                rt: currentSession.refresh_token,
+                quickAccessUntil: Date.now() + 60 * 60 * 1000, // 1 hora
+              }));
+            } catch { /* ignore */ }
+          }
+          // scope: 'local' — borra la sesión local pero NO revoca el token en el servidor
+          await supabase.auth.signOut({ scope: 'local' });
         } catch (error) {
           console.error("Error signing out", error);
         }
@@ -8454,6 +8743,10 @@ export default function CarbotApp() {
         onClose={() => setShowDealerSwitcher(false)}
         dealers={allDealers}
         onSelect={handleDealerSelect}
+        isSuperAdmin={isSuperAdmin}
+        onSoftDelete={handleSoftDeleteDealer}
+        onRecover={handleRecoverDealer}
+        onCreateDealer={handleCreateDealer}
       />
     </>
   );
