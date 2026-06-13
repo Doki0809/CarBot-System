@@ -5,6 +5,18 @@ import { useI18n } from '../i18n/I18nContext.jsx';
 
 const STEP = { EMAIL: 1, CONFIRM: 2, PASSWORD: 3, HELP: 4 };
 
+const getSeenEmails = () => {
+  try { return new Set(JSON.parse(localStorage.getItem('carbot-seen-emails') || '[]')); }
+  catch { return new Set(); }
+};
+const markEmailSeen = (emailAddr) => {
+  try {
+    const seen = getSeenEmails();
+    seen.add(emailAddr.trim().toLowerCase());
+    localStorage.setItem('carbot-seen-emails', JSON.stringify([...seen]));
+  } catch { /* ignore */ }
+};
+
 export default function LoginView({ onLoginSuccess }) {
   const { t } = useI18n();
 
@@ -41,8 +53,6 @@ export default function LoginView({ onLoginSuccess }) {
   const [mounted, setMounted] = useState(false);
   const [savedUser, setSavedUser] = useState(null); // { name, email, lastLoginAt }
 
-  const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
-
   useEffect(() => {
     try {
       const raw = localStorage.getItem('carbot-last-user');
@@ -72,6 +82,8 @@ export default function LoginView({ onLoginSuccess }) {
   // Reset error on step change
   useEffect(() => { setError(''); }, [step]);
 
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
   const saveLastUser = (name, emailAddr, refreshToken) => {
     try {
       const existing = JSON.parse(localStorage.getItem('carbot-last-user') || '{}');
@@ -80,6 +92,7 @@ export default function LoginView({ onLoginSuccess }) {
         name: name || emailAddr,
         email: emailAddr,
         lastLoginAt: Date.now(),
+        quickAccessUntil: Date.now() + SEVEN_DAYS_MS,
         ...(refreshToken ? { rt: refreshToken } : {}),
       }));
     } catch { /* ignore */ }
@@ -88,63 +101,38 @@ export default function LoginView({ onLoginSuccess }) {
   // ── Acceso rápido con usuario guardado ────────────────────────
   const handleQuickAccess = async () => {
     if (!savedUser) return;
-    const isRecent = Date.now() - savedUser.lastLoginAt < FIFTEEN_DAYS_MS;
     setEmail(savedUser.email);
     setLoading(true);
     setError('');
 
-    if (isRecent) {
-      // < 15 días → restaurar sesión con refresh_token (sin contraseña)
-      try {
-        // 1) Intentar sesión activa en memoria
-        const { data: { session: existing } } = await supabase.auth.getSession();
-        if (existing?.user) {
-          saveLastUser(savedUser.name, savedUser.email, existing.refresh_token);
-          onLoginSuccess?.(existing.user);
-          return;
-        }
-        // 2) Intentar refresh_token guardado
-        const rt = savedUser.rt;
-        if (rt) {
-          const { data: refreshed, error: refreshErr } = await supabase.auth.refreshSession({ refresh_token: rt });
-          if (!refreshErr && refreshed?.session?.user) {
-            saveLastUser(savedUser.name, savedUser.email, refreshed.session.refresh_token);
-            onLoginSuccess?.(refreshed.session.user);
-            return;
-          }
-        }
-        // 3) Sin sesión recuperable → pedir contraseña
-        setGhlUser({ name: savedUser.name, email: savedUser.email });
-        setIsNewUser(false);
-        setStep(STEP.PASSWORD);
-      } catch {
-        setGhlUser({ name: savedUser.name, email: savedUser.email });
-        setIsNewUser(false);
-        setStep(STEP.PASSWORD);
-      } finally {
-        setLoading(false);
+    try {
+      // 1) Sesión activa en memoria
+      const { data: { session: existing } } = await supabase.auth.getSession();
+      if (existing?.user) {
+        saveLastUser(savedUser.name, savedUser.email, existing.refresh_token);
+        onLoginSuccess?.(existing.user);
+        return;
       }
-    } else {
-      // > 15 días → lookup completo + pedir contraseña
-      try {
-        const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/lookup-ghl-user`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: savedUser.email }),
-        });
-        const data = await res.json();
-        if (!data.found) {
-          setError(data.error?.message || t('login_user_not_found'));
-        } else {
-          setGhlUser(data);
-          setIsNewUser(data.isNew || data.needsPassword);
-          setStep(STEP.PASSWORD);
-        }
-      } catch {
-        setError(t('login_connection_error'));
-      } finally {
-        setLoading(false);
+
+      // 2) Refresh silencioso — Supabase usa el token almacenado en carbot-session
+      const { data: refreshed, error: refreshErr } = await supabase.auth.refreshSession();
+      if (!refreshErr && refreshed?.session?.user) {
+        markEmailSeen(savedUser.email);
+        saveLastUser(savedUser.name, savedUser.email, refreshed.session.refresh_token);
+        onLoginSuccess?.(refreshed.session.user);
+        return;
       }
+
+      // 3) Sesión expirada → pedir contraseña (renovará quickAccessUntil al entrar)
+      setGhlUser({ name: savedUser.name, email: savedUser.email });
+      setIsNewUser(false);
+      setStep(STEP.PASSWORD);
+    } catch {
+      setGhlUser({ name: savedUser.name, email: savedUser.email });
+      setIsNewUser(false);
+      setStep(STEP.PASSWORD);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -169,7 +157,8 @@ export default function LoginView({ onLoginSuccess }) {
         }
         setGhlUser(data);
         setIsNewUser(data.isNew || data.needsPassword);
-        setStep(STEP.CONFIRM);
+        const isFirstTime = !getSeenEmails().has(email.trim().toLowerCase());
+        setStep(isFirstTime ? STEP.CONFIRM : STEP.PASSWORD);
       }
     } catch {
       setError(t('login_connection_error'));
@@ -212,6 +201,7 @@ export default function LoginView({ onLoginSuccess }) {
         });
         if (loginErr) throw loginErr;
         if (!rememberMe) localStorage.removeItem('carbot-session');
+        markEmailSeen(email.trim().toLowerCase());
         saveLastUser(ghlUser?.name, email.trim().toLowerCase(), loginData.session?.refresh_token);
         onLoginSuccess?.({ ...loginData.user, ...ghlUser });
         return;
@@ -239,6 +229,7 @@ export default function LoginView({ onLoginSuccess }) {
       });
       if (loginErr) throw loginErr;
       if (!rememberMe) localStorage.removeItem('carbot-session');
+      markEmailSeen(email.trim().toLowerCase());
       saveLastUser(ghlUser?.name, email.trim().toLowerCase(), loginData.session?.refresh_token);
       onLoginSuccess?.({ ...loginData.user, ...ghlUser });
     } catch (err) {
@@ -261,6 +252,7 @@ export default function LoginView({ onLoginSuccess }) {
       });
       if (loginErr) throw loginErr;
       if (!rememberMe) localStorage.removeItem('carbot-session');
+      markEmailSeen(email.trim().toLowerCase());
       saveLastUser(ghlUser?.name || data.user?.email, email.trim().toLowerCase(), data.session?.refresh_token);
       onLoginSuccess?.(data.user);
     } catch (err) {
@@ -778,7 +770,7 @@ export default function LoginView({ onLoginSuccess }) {
                         {savedUser.name?.charAt(0).toUpperCase()}
                       </div>
                       <span style={{ fontSize: '14px', fontWeight: 500, color: 'rgba(255,255,255,0.8)', whiteSpace: 'nowrap' }}>
-                        ¿Eres <strong style={{ color: '#E31C25' }}>{savedUser.name?.split(' ')[0]}</strong>?
+                        Continuar como <strong style={{ color: '#E31C25' }}>{savedUser.name?.split(' ')[0]}</strong>
                       </span>
                     </button>
                     <button
