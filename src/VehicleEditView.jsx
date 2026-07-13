@@ -6,7 +6,7 @@ import {
   X, Info, Share2, Heart, Files, CheckCircle, CheckCircle2, Lock, Trash2, Camera, Phone, Mail,
   Shield, User, Users, Activity, Zap, FileText, Quote, Tag, AlertTriangle,
   FileSignature, MoreVertical, Copy, RefreshCw, Edit, Plus, CloudUpload, Check,
-  Briefcase, MapPin, Gauge, LifeBuoy, Key, Palette, Hash, Building2, Car
+  Briefcase, MapPin, Gauge, LifeBuoy, Key, Palette, Hash, Building2, Car, Link
 } from 'lucide-react';
 import { useI18n } from './i18n/I18nContext.jsx';
 import { useCurrency } from './CurrencyContext.jsx';
@@ -137,15 +137,15 @@ const FormInput = ({ label, icon: Icon, name, value, onChange, type = "text", di
         {label}
       </label>
     )}
-    <div className={`relative flex items-center rounded-2xl focus-within:border-red-500/20 focus-within:ring-4 focus-within:ring-red-500/5 transition-all outline-none ${isSold ? 'opacity-60 grayscale-[0.5]' : ''} ${className}`} style={{ backgroundColor: 'var(--input-bg)', borderWidth: '2px', borderColor: 'var(--input-border)' }}>
-      {Icon && <div className="pl-4 group-focus-within:text-red-500 transition-colors" style={{ color: 'var(--text-tertiary)' }}><Icon size={18} /></div>}
+    <div className={`relative flex items-center rounded-2xl overflow-hidden focus-within:border-red-500/20 focus-within:ring-4 focus-within:ring-red-500/5 transition-all outline-none ${isSold ? 'opacity-60 grayscale-[0.5]' : ''} ${className}`} style={{ backgroundColor: 'var(--input-bg)', borderWidth: '2px', borderColor: 'var(--input-border)' }}>
+      {Icon && <div className="pl-4 flex items-center shrink-0 group-focus-within:text-red-500 transition-colors" style={{ color: 'var(--text-tertiary)' }}><Icon size={18} /></div>}
       <input
         type={type}
         name={name}
         value={value}
         onChange={onChange}
         disabled={disabled || isSold}
-        className="w-full px-4 py-3 bg-transparent font-bold text-sm outline-none"
+        className={`w-full py-3 bg-transparent font-bold text-sm outline-none ${Icon ? 'pl-3 pr-4' : 'px-4'}`}
         style={{ color: 'var(--text-primary)' }}
       />
     </div>
@@ -177,6 +177,25 @@ export default function VehicleEditView({
   const [isLightboxOpen, setIsLightboxOpen] = useState(false);
   const [touchStart, setTouchStart] = useState(null);
   const [touchEnd, setTouchEnd] = useState(null);
+  const [linkCopied, setLinkCopied] = useState(false);
+
+  const handleCopyLink = async () => {
+    const link = (formData.link_externo || '').trim();
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 1800);
+    } catch {
+      // Fallback para navegadores sin clipboard API
+      const ta = document.createElement('textarea');
+      ta.value = link;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 1800); } catch { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+  };
 
   const minSwipeDistance = 50;
 
@@ -239,6 +258,7 @@ export default function VehicleEditView({
     condition: vehicle?.condicion || vehicle?.condition || '-',
     condicion: vehicle?.condicion || vehicle?.condition || '-',
     clean_carfax: vehicle?.clean_carfax || vehicle?.condicion_carfax || vehicle?.carfaxCondition || vehicle?.detalles?.clean_carfax || '-',
+    link_externo: vehicle?.link_externo || vehicle?.detalles?.link_externo || '',
 
     // Convert boolean flags to "Sí" / "No" / "-" for the dropdowns
     // ONLY map to "No" if it is explicitly the string 'No' in detalles or at the top level
@@ -278,6 +298,7 @@ export default function VehicleEditView({
         condition: vehicle?.condicion || vehicle?.condition || '-',
         condicion: vehicle?.condicion || vehicle?.condition || '-',
         clean_carfax: vehicle?.clean_carfax || vehicle?.condicion_carfax || vehicle?.carfaxCondition || vehicle?.detalles?.clean_carfax || '-',
+        link_externo: vehicle?.link_externo || vehicle?.detalles?.link_externo || '',
 
         // Convert boolean flags to "Sí" / "No" / "-" for the dropdowns
         // ONLY map to "No" if it is explicitly the string 'No' in detalles or at the top level
@@ -947,6 +968,16 @@ export default function VehicleEditView({
         <h2 className="text-3xl font-black text-slate-900 uppercase tracking-tight leading-none">
           {formData.make} <span className="text-red-600">{formData.model}</span>
         </h2>
+        {(formData.createdAt || formData.updatedAt) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-[9px] font-bold uppercase tracking-widest" style={{ color: 'var(--text-tertiary)' }}>
+            {formData.createdAt && !isNaN(new Date(formData.createdAt).getTime()) && (
+              <span>Agregado: {new Date(formData.createdAt).toLocaleDateString('es-DO', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
+            )}
+            {formData.updatedAt && !isNaN(new Date(formData.updatedAt).getTime()) && (
+              <span>Actualizado: {new Date(formData.updatedAt).toLocaleDateString('es-DO', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
+            )}
+          </div>
+        )}
       </div>
 
       <form onSubmit={handleSubmit} className="grid grid-cols-1 xl:grid-cols-12 gap-8 xl:gap-10">
@@ -1047,6 +1078,16 @@ export default function VehicleEditView({
                 {formData.make} <br />
                 <span className="text-red-700">{formData.model}</span>
               </h2>
+              {(formData.createdAt || formData.updatedAt) && (
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-2 text-[10px] font-bold uppercase tracking-widest" style={{ color: 'var(--text-tertiary)' }}>
+                  {formData.createdAt && !isNaN(new Date(formData.createdAt).getTime()) && (
+                    <span>Agregado: {new Date(formData.createdAt).toLocaleDateString('es-DO', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
+                  )}
+                  {formData.updatedAt && !isNaN(new Date(formData.updatedAt).getTime()) && (
+                    <span>Actualizado: {new Date(formData.updatedAt).toLocaleDateString('es-DO', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
+                  )}
+                </div>
+              )}
             </div>
 
 
@@ -1298,6 +1339,39 @@ export default function VehicleEditView({
                     <FormInput label={t('field_plate')} name="plate" value={formData.plate || formData.placa} onChange={handleChange} className="font-mono text-xs tracking-wider" />
                   </div>
                 </div>
+
+                {/* LINK DE FOTOS (Instagram, Drive, etc.) */}
+                <div className="group">
+                  <label className="block text-[10px] font-black uppercase tracking-[0.2em] mb-1.5 ml-1 transition-colors group-focus-within:text-red-600" style={{ color: 'var(--text-secondary)' }}>
+                    {t('field_photo_link')}
+                  </label>
+                  <div className="flex items-center rounded-2xl overflow-hidden focus-within:border-red-500/20 focus-within:ring-4 focus-within:ring-red-500/5 transition-all" style={{ backgroundColor: 'var(--input-bg)', borderWidth: '2px', borderColor: 'var(--input-border)' }}>
+                    <div className="flex items-center justify-center w-11 self-stretch shrink-0 group-focus-within:text-red-500 transition-colors" style={{ color: 'var(--text-tertiary)' }}>
+                      <Link size={18} />
+                    </div>
+                    <input
+                      type="url"
+                      name="link_externo"
+                      value={formData.link_externo || ''}
+                      onChange={handleChange}
+                      placeholder="https://instagram.com/p/…"
+                      className="flex-1 min-w-0 py-3 pr-2 bg-transparent font-bold text-sm outline-none"
+                      style={{ color: 'var(--text-primary)' }}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleCopyLink}
+                      disabled={!formData.link_externo}
+                      title={t('copy_link')}
+                      className={`flex items-center gap-1.5 m-1 px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider shrink-0 transition-all disabled:opacity-40 disabled:cursor-not-allowed ${linkCopied ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white hover:bg-red-700'}`}
+                    >
+                      {linkCopied ? <><Check size={13} /> {t('copied')}</> : <><Copy size={13} /> {t('copy_link')}</>}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[10px] -mt-2 ml-1" style={{ color: 'var(--text-tertiary)' }}>
+                  {t('photo_link_hint')}
+                </p>
               </div>
 
               {/* COL 2: MECÁNICA GENERAL */}
