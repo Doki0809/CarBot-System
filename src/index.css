@@ -50,8 +50,8 @@
   --nav-pill-bg:  rgba(255, 255, 255, 0.92);
 
   /* Inputs */
-  --input-bg:     #F5F5F7;
-  --input-border: rgba(0, 0, 0, 0.10);
+  --input-bg:     #EEEEF1;
+  --input-border: rgba(0, 0, 0, 0.14);
   --input-focus:  var(--accent);
 
   /* Misc */
