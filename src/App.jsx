@@ -1,10 +1,9 @@
-import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
 // import imageCompression from 'browser-image-compression';
 import { db, auth, storage } from './firebaseConfig';
-import { updatePassword } from 'firebase/auth';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { supabase } from './supabase.js';
+import { supabase, SUPABASE_FUNCTIONS_URL } from './supabase.js';
 import LoginView from './components/LoginView.jsx';
 import {
   collection,
@@ -32,20 +31,45 @@ import {
   PlusCircle, Box, ArrowUpRight, Building2, Fingerprint, Lock, EyeOff, Share2, Check, ArrowRight, Key, Copy, Link,
   AlertTriangle, TrendingUp, History, Bell, Calendar, Briefcase, Inbox, Headset, Sparkles, Camera,
   ChevronLeft, ChevronRight, Save, ChevronDown, MoreVertical, FileCode, AtSign, Building, LayoutGrid, ShieldCheck,
-  Phone, Mail, RefreshCw, Users, MessageCircle, UploadCloud, FileSpreadsheet, Table2
+  Phone, Mail, RefreshCw, Users, MessageCircle, UploadCloud, FileSpreadsheet, Table2, Clock
 } from 'lucide-react';
-import VehicleEditView from './VehicleEditView';
 import VinDecoderSection from './components/VinDecoderSection.jsx';
 import { mapVinToFormFields } from './utils/vinDecoder.js';
-import ContactsView from './ContactsView';
-import ConversationsView from './ConversationsView';
+import { fetchDealerRateConfig, resolveExchangeRate, convertAmount, getLastRateMeta, DEFAULT_PRIMARY_CURRENCY, DEFAULT_SECONDARY_CURRENCY, DEFAULT_AUTO_INITIAL_PCT } from './utils/exchangeRate.js';
+import { formatWithCommas, parseCommaNumber, cursorPosAfterFormat } from './utils/formatInput.js';
+// Heavy views loaded on demand (only when their tab/route is active) to shrink the initial bundle.
+const VehicleEditView = lazy(() => import('./VehicleEditView'));
+const ContactsView = lazy(() => import('./ContactsView'));
+const ConversationsView = lazy(() => import('./ConversationsView'));
 import { generarContratoEnGHL } from './ghl_integration/ghlService';
 import { requestNotificationPermission, onForegroundMessage, sendDealerNotification } from './notifications';
 import { useI18n } from './i18n/I18nContext.jsx';
 import { useTheme } from './ThemeContext.jsx';
 import { useCurrency, CURRENCIES, CURRENCY_CODES } from './CurrencyContext.jsx';
 
-// Importar html2pdf.js de forma dinámica para evitar problemas de SSR si fuera necesario, 
+// Formatea fecha+hora de vehículos (created_at/updated_at) de forma compacta: "10 jul 2026 · 3:28 PM"
+export const formatVehicleTimestamp = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const datePart = d.toLocaleDateString('es-DO', { day: '2-digit', month: 'short', year: 'numeric' });
+  const timePart = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return `${datePart} · ${timePart}`;
+};
+
+// Normaliza teléfono a E.164 (por defecto NANP/+1, contexto RD) para que coincida
+// con el formato que usa el backend al buscar comprador por teléfono (integración Cloy).
+export const toE164 = (raw) => {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (s.startsWith('+')) return s;
+  const digits = s.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return digits ? `+${digits}` : null;
+};
+
+// Importar html2pdf.js de forma dinámica para evitar problemas de SSR si fuera necesario,
 // o directamente ya que es una SPA de Vite.
 // import html2pdf from 'html2pdf.js';
 
@@ -210,6 +234,81 @@ const Input = ({ label, className = "", type = "text", error, ...props }) => (
   </div>
 );
 
+// --- WHEEL PICKER (slot-machine style scroll picker) ---
+const WheelPicker = ({ items, value, onChange, itemHeight = 40, visibleCount = 5 }) => {
+  const containerRef = useRef(null);
+  const scrollTimeoutRef = useRef(null);
+  const height = itemHeight * visibleCount;
+  const padCount = Math.floor(visibleCount / 2);
+
+  const selectedIndex = items.findIndex(it => it.value === value);
+
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el || selectedIndex < 0) return;
+    el.scrollTop = selectedIndex * itemHeight;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || selectedIndex < 0) return;
+    const target = selectedIndex * itemHeight;
+    if (Math.abs(el.scrollTop - target) > itemHeight / 2) {
+      el.scrollTop = target;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  const handleScroll = () => {
+    if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+    scrollTimeoutRef.current = setTimeout(() => {
+      const el = containerRef.current;
+      if (!el) return;
+      const idx = Math.round(el.scrollTop / itemHeight);
+      const clamped = Math.max(0, Math.min(items.length - 1, idx));
+      el.scrollTo({ top: clamped * itemHeight, behavior: 'smooth' });
+      const newItem = items[clamped];
+      if (newItem && newItem.value !== value && onChange) onChange(newItem.value);
+    }, 90);
+  };
+
+  return (
+    <div className="relative select-none" style={{ height }}>
+      <div
+        className="absolute left-0 right-0 pointer-events-none border-y-2 border-red-500/70 bg-red-50/40 z-10"
+        style={{ top: padCount * itemHeight, height: itemHeight }}
+      />
+      <div className="absolute inset-x-0 top-0 h-1/3 bg-gradient-to-b from-white to-transparent z-20 pointer-events-none" />
+      <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-white to-transparent z-20 pointer-events-none" />
+      <div
+        ref={containerRef}
+        onScroll={handleScroll}
+        className="h-full overflow-y-scroll no-scrollbar"
+        style={{ scrollSnapType: 'y mandatory' }}
+      >
+        <div style={{ height: padCount * itemHeight }} />
+        {items.map((it) => (
+          <div
+            key={it.value}
+            onClick={() => {
+              const el = containerRef.current;
+              const idx = items.findIndex(i => i.value === it.value);
+              if (el) el.scrollTo({ top: idx * itemHeight, behavior: 'smooth' });
+              if (onChange) onChange(it.value);
+            }}
+            className={`flex items-center justify-center font-black uppercase tracking-widest cursor-pointer transition-all ${it.value === value ? 'text-red-600 text-lg scale-100' : 'text-slate-300 text-sm scale-90'}`}
+            style={{ height: itemHeight, scrollSnapAlign: 'center' }}
+          >
+            {it.label}
+          </div>
+        ))}
+        <div style={{ height: padCount * itemHeight }} />
+      </div>
+    </div>
+  );
+};
+
 const Select = ({ label, options = [], name, defaultValue, value, onChange, disabled, ...props }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [selectedValue, setSelectedValue] = useState(value || defaultValue || (options[0]?.value || options[0]));
@@ -261,6 +360,13 @@ const Select = ({ label, options = [], name, defaultValue, value, onChange, disa
           <div className="max-h-60 overflow-y-auto custom-scrollbar flex flex-col gap-1">
             {options.map((opt, i) => {
               const isObj = typeof opt === 'object' && opt !== null;
+              if (isObj && opt.header) {
+                return (
+                  <div key={i} className={`px-3 pb-1 text-[9px] font-black uppercase tracking-widest ${i === 0 ? 'pt-1' : 'pt-3'}`} style={{ color: 'var(--text-tertiary)' }}>
+                    {opt.header}
+                  </div>
+                );
+              }
               const optionValue = isObj ? opt.value : opt;
               const optionLabel = isObj ? opt.label : opt;
               const isSelected = selectedValue === optionValue;
@@ -330,6 +436,27 @@ const ActionSelectionModal = ({ isOpen, onClose, onSelect }) => {
   );
 };
 
+// Tope de fotos por vehículo. Nada más abajo en la cadena (catálogo público,
+// endpoint del bot, feed de Meta) recorta el arreglo, así que este es el único
+// punto de control.
+const MAX_PHOTOS = 20;
+// Comprimir 20 imágenes a la vez levanta 20 web workers y ahoga el navegador.
+// De a 4 el progreso avanza parejo y la memoria se mantiene estable.
+const CONCURRENT_COMPRESSIONS = 4;
+// Escalera de compresión: si un paso falla o deja la foto todavía muy pesada,
+// se reintenta más agresivo en vez de rendirse. Una foto de 20 MB del celular
+// se resuelve en el primer paso (se reescala a 2000px); sólo formatos raros o
+// memoria justa llegan a los siguientes.
+const PHOTO_MAX_SIZE_MB = 3;
+const COMPRESSION_STEPS = [
+  { maxSizeMB: PHOTO_MAX_SIZE_MB, maxWidthOrHeight: 2000, initialQuality: 0.9 },
+  { maxSizeMB: 2, maxWidthOrHeight: 1600, initialQuality: 0.75 },
+  { maxSizeMB: 1, maxWidthOrHeight: 1200, initialQuality: 0.6 },
+];
+// Si ni un solo paso funcionó y el original pesa más que esto, no se sube: un
+// archivo así tarda muchísimo y probablemente falle a mitad de camino.
+const PHOTO_HARD_LIMIT_MB = 8;
+
 const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile }) => {
   const { t } = useI18n();
   const { selected: selectedCurrencies, getSymbol } = useCurrency();
@@ -341,10 +468,49 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
   const [mileageUnit, setMileageUnit] = useState(initialData?.mileage_unit || 'KM');
   const [mileageValue, setMileageValue] = useState(String(initialData?.mileage ?? ''));
   const [isOptimizing, setIsOptimizing] = useState(false);
+  const [photoError, setPhotoError] = useState('');
+  const [photoProgress, setPhotoProgress] = useState({ done: 0, total: 0 });
   const [status, setStatus] = useState(initialData?.status || 'available');
+  const [linkExterno, setLinkExterno] = useState(initialData?.detalles?.link_externo || initialData?.link_externo || '');
   const formRef = useRef(null);
   // Controlled values for selects filled by VIN decoder
   const [vinSelects, setVinSelects] = useState({});
+  const [rateConfig, setRateConfig] = useState(null); // { primary, secondary, rate, isManual }
+
+  useEffect(() => {
+    // Este modal suele quedar montado (solo oculto) entre aperturas, así que
+    // sin `isOpen` en las deps la config de tasa/% se pediría UNA sola vez por
+    // sesión — cualquier cambio hecho después en Ajustes (moneda, tasa manual,
+    // % inicial automático) nunca se vería reflejado sin recargar la página.
+    if (!isOpen) return;
+    const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+    if (!dealerId) return;
+    let cancelled = false;
+    (async () => {
+      const config = await fetchDealerRateConfig(supabase, dealerId);
+      const primary = config?.primary || DEFAULT_PRIMARY_CURRENCY;
+      const secondary = config?.secondary || DEFAULT_SECONDARY_CURRENCY;
+      const { rate, isManual, ratesToPrimary } = await resolveExchangeRate({ primary, secondary, manualRate: config?.manualRate });
+      if (!cancelled) setRateConfig({ primary, secondary, rate, isManual, ratesToPrimary, autoInitialPct: config?.autoInitialPct });
+    })();
+    return () => { cancelled = true; };
+  }, [userProfile?.supabaseDealerId, userProfile?.dealerId, isOpen]);
+
+  // Recalcula el inicial en cuanto llega/cambia la config de tasa+% — no solo
+  // cuando el usuario retipea el precio. Sin esto, reabrir un vehículo después
+  // de cambiar el % en Ajustes seguía mostrando el inicial calculado con el %
+  // viejo hasta que se tocara el campo Precio.
+  useEffect(() => {
+    if (!rateConfig || leaveInitialEmpty || initialManuallyEditedRef.current) return;
+    const priceNum = Number(prices.price) || 0;
+    if (priceNum <= 0) return;
+    const autoPct = (rateConfig.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+    const priceInPrimary = convertAmount(priceNum, currency, rateConfig.primary, rateConfig.ratesToPrimary);
+    const recalculated = String(Math.round(priceInPrimary * autoPct));
+    if (recalculated !== prices.initial) setPrices(prev => ({ ...prev, initial: recalculated }));
+    if (downPaymentCurrency !== rateConfig.primary) setDownPaymentCurrency(rateConfig.primary);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rateConfig]);
 
   // Text inputs that can be filled by VIN decoder via DOM
   const VIN_TEXT_INPUTS = ['make', 'model', 'year', 'edition', 'vin', 'engine_cyl', 'engine_cc'];
@@ -380,21 +546,39 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     }
   };
 
-  const formatWithCommas = (value) => {
-    if (!value && value !== 0) return '';
-    const str = value.toString().replace(/\D/g, '');
-    return str.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  };
-
-  const parseCommaNumber = (str) => {
-    return str.toString().replace(/,/g, '');
-  };
 
 
   const [prices, setPrices] = useState({
     price: '',
     initial: ''
   });
+  // Autorelleno del inicial (30% del precio) mientras el usuario no lo haya
+  // tocado a mano ni marcado "dejar vacío" — se reinicia cada vez que el modal
+  // carga un vehículo distinto (ver el useEffect de abajo).
+  const initialManuallyEditedRef = useRef(false);
+  const [leaveInitialEmpty, setLeaveInitialEmpty] = useState(false);
+
+  // Al reformatear con comas en cada tecla, el navegador manda el cursor al
+  // final. Guardamos la posición deseada y la restauramos tras el repintado.
+  const priceInputRef = useRef(null);
+  const initialInputRef = useRef(null);
+  const pendingCursorRef = useRef({ price: null, initial: null });
+
+  useLayoutEffect(() => {
+    const pos = pendingCursorRef.current.price;
+    if (pos !== null && priceInputRef.current) {
+      priceInputRef.current.setSelectionRange(pos, pos);
+      pendingCursorRef.current.price = null;
+    }
+  }, [prices.price]);
+
+  useLayoutEffect(() => {
+    const pos = pendingCursorRef.current.initial;
+    if (pos !== null && initialInputRef.current) {
+      initialInputRef.current.setSelectionRange(pos, pos);
+      pendingCursorRef.current.initial = null;
+    }
+  }, [prices.initial]);
 
   useEffect(() => {
     if (initialData && isOpen) {
@@ -406,7 +590,19 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
         price: initialData.precio > 0 ? initialData.precio.toString() : (initialData.price_dop > 0 ? initialData.price_dop.toString() : (initialData.price?.toString() || '')),
         initial: initialData.inicial > 0 ? initialData.inicial.toString() : (initialData.initial_payment_dop > 0 ? initialData.initial_payment_dop.toString() : (initialData.initial_payment?.toString() || ''))
       });
+      // Usamos el flag guardado en DB (inicial_automatico) para decidir si este
+      // inicial se puede recalcular: si es explícitamente true, el dealer nunca
+      // lo tocó a mano y es seguro recalcular. Si es false o desconocido (datos
+      // viejos, de antes de este flag), lo tratamos como manual — NUNCA pisar
+      // un valor que pudo haber sido escrito a mano por el dealer.
+      const hasRealInitial = initialData.inicial > 0 || initialData.initial_payment_dop > 0 || initialData.initial_payment > 0;
+      const hasRealPrice = initialData.precio > 0 || initialData.price_dop > 0 || initialData.price > 0;
+      initialManuallyEditedRef.current = hasRealInitial ? (initialData.inicial_automatico !== true) : false;
+      // Si ya tiene precio guardado pero nunca se le puso inicial, asumimos que se
+      // dejó vacío a propósito la vez anterior — mostrar el checkbox ya marcado.
+      setLeaveInitialEmpty(!hasRealInitial && hasRealPrice);
       setStatus(initialData.status || initialData.estado || 'available');
+      setLinkExterno(initialData.detalles?.link_externo || initialData.link_externo || '');
 
       // Populate Photos
       if (initialData.images && Array.isArray(initialData.images)) {
@@ -421,6 +617,8 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       setDownPaymentCurrency('USD');
       setMileageUnit('MI');
       setPrices({ price: '', initial: '' });
+      initialManuallyEditedRef.current = false;
+      setLeaveInitialEmpty(false);
     }
   }, [initialData, isOpen]);
 
@@ -430,50 +628,71 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     const files = Array.from(e.target.files);
     const totalCurrent = photos.length;
 
-    if (totalCurrent + files.length > 10) {
-      alert(`Límite excedido.Máximo 10 fotos.`);
+    if (totalCurrent + files.length > MAX_PHOTOS) {
+      setPhotoError(`Máximo ${MAX_PHOTOS} fotos. Tienes ${totalCurrent} y estás agregando ${files.length}.`);
+      e.target.value = '';
       return;
     }
+    setPhotoError('');
 
     if (files.length > 0) {
       setIsOptimizing(true);
+      setPhotoProgress({ done: 0, total: files.length });
       try {
         // Dynamic import to avoid build/load issues
         const imageCompression = (await import('browser-image-compression')).default;
 
-        const compressedFilesPromises = files.map(async (file) => {
-          // Opciones de compresión inteligente
-          const options = {
-            maxSizeMB: 2,          // Límite de 2MB
-            maxWidthOrHeight: 2000, // Resolución max 2000px
-            useWebWorker: true,
-            initialQuality: 0.9,   // Calidad visual alta
-          };
-
+        // Devuelve { file, optimized }. Nunca lanza: si todo falla se queda con
+        // el original y quien llama decide si es demasiado pesado para subirlo.
+        const compressOne = async (file) => {
           try {
-            const compressedFile = await imageCompression(file, options);
-            // Si por alguna razón la compresión falla o devuelve algo null, usamos el original
-            return compressedFile || file;
-          } catch (error) {
-            console.error("Error al comprimir imagen:", error);
-            return file; // Fallback al original
+            let best = null;
+            for (const step of COMPRESSION_STEPS) {
+              try {
+                const out = await imageCompression(file, { ...step, useWebWorker: true });
+                if (!out) continue;
+                best = out;
+                if (out.size <= step.maxSizeMB * 1024 * 1024) break;
+              } catch (error) {
+                console.error(`Compresión falló en el paso ${step.maxWidthOrHeight}px:`, error);
+              }
+            }
+            return { file: best || file, optimized: !!best };
+          } finally {
+            setPhotoProgress(prev => ({ ...prev, done: prev.done + 1 }));
           }
-        });
+        };
 
-        const compressedFiles = await Promise.all(compressedFilesPromises);
+        const results = [];
+        for (let i = 0; i < files.length; i += CONCURRENT_COMPRESSIONS) {
+          const batch = files.slice(i, i + CONCURRENT_COMPRESSIONS);
+          results.push(...await Promise.all(batch.map(compressOne)));
+        }
 
-        const newItems = compressedFiles.map(file => ({
-          url: URL.createObjectURL(file),
-          file: file,
+        // Las que no se pudieron optimizar sí se suben, salvo que sean enormes.
+        const tooBig = results.filter(r => !r.optimized && r.file.size > PHOTO_HARD_LIMIT_MB * 1024 * 1024);
+        const usable = results.filter(r => !tooBig.includes(r));
+
+        const newItems = usable.map(r => ({
+          url: URL.createObjectURL(r.file),
+          file: r.file,
           isExisting: false
         }));
 
         setPhotos(prev => [...prev, ...newItems]);
+
+        if (tooBig.length > 0) {
+          setPhotoError(`${tooBig.length} foto(s) no se pudieron procesar y pesan más de ${PHOTO_HARD_LIMIT_MB} MB, así que no se agregaron. Conviértelas a JPG e inténtalo de nuevo.`);
+        } else {
+          const raw = usable.filter(r => !r.optimized).length;
+          if (raw > 0) setPhotoError(`${raw} foto(s) se agregaron sin optimizar — la subida puede tardar más.`);
+        }
       } catch (error) {
         console.error("Error general procesando imágenes:", error);
-        alert("Hubo un error procesando alguna de las imágenes.");
+        setPhotoError('Hubo un error procesando las imágenes. Inténtalo de nuevo.');
       } finally {
         setIsOptimizing(false);
+        setPhotoProgress({ done: 0, total: 0 });
       }
     }
   };
@@ -544,6 +763,13 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       if (data[key] === '-') data[key] = '';
     });
 
+    // --- NORMALIZE UPPERCASE FIELDS ---
+    ['make', 'model', 'edition', 'color', 'plate', 'vin', 'chassis'].forEach(key => {
+      if (data[key] && typeof data[key] === 'string') {
+        data[key] = data[key].toUpperCase();
+      }
+    });
+
     // --- PRECIO ---
     const priceValue = Number(prices.price);
     data.price = priceValue;
@@ -551,9 +777,24 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     delete data.price_unified;
 
     // --- INICIAL ---
-    const initialValue = Number(prices.initial);
+    // Red de seguridad: si no está marcado "dejar vacío" y el inicial quedó en
+    // 0 (por ejemplo el usuario nunca tocó el campo precio), lo calculamos aquí
+    // mismo antes de guardar en vez de guardar un 0 no intencional.
+    let initialValue = Number(prices.initial) || 0;
+    let finalDownPaymentCurrency = downPaymentCurrency;
+    if (!leaveInitialEmpty && initialValue <= 0 && priceValue > 0) {
+      const autoPct = (rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+      if (rateConfig) {
+        const priceInPrimary = convertAmount(priceValue, currency, rateConfig.primary, rateConfig.ratesToPrimary);
+        initialValue = Math.round(priceInPrimary * autoPct);
+        finalDownPaymentCurrency = rateConfig.primary;
+      } else {
+        initialValue = Math.round(priceValue * autoPct);
+      }
+    }
     data.initial_payment = initialValue;
-    data.downPaymentCurrency = downPaymentCurrency;
+    data.downPaymentCurrency = finalDownPaymentCurrency;
+    data.inicial_automatico = !leaveInitialEmpty && !initialManuallyEditedRef.current;
     delete data.initial_unified;
 
     // --- MILLAJE ---
@@ -584,29 +825,43 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       const folderName = `${year}_${make}_${model}_${color}_${last4Vin}`.trim();
       const baseStoragePath = `dealer_${cleanDealerName}/Marcas/${folderName}`;
 
+      // Una subida fallida no puede pasar desapercibida: antes se registraba en
+      // consola y la foto desaparecía del vehículo sin avisar a nadie.
+      const failedPhotos = [];
       for (let i = 0; i < photos.length; i++) {
         const item = photos[i];
         if (item.isExisting) {
           uploadedUrls.push(item.url);
         } else if (item.file) {
-          try {
-            const cleanName = (item.file.name || `image_${i}.jpg`).replace(/[^a-zA-Z0-9.-]/g, '_').toLowerCase();
-            const storagePath = `${baseStoragePath}/${Date.now()}_${cleanName}`;
-
-            const storageRef = ref(storage, storagePath);
-            await uploadBytes(storageRef, item.file);
-            const downloadUrl = await getDownloadURL(storageRef);
-
-            uploadedUrls.push(downloadUrl);
-          } catch (err) {
-            console.error("Error uploading photo to Supabase:", err);
+          const cleanName = (item.file.name || `image_${i}.jpg`).replace(/[^a-zA-Z0-9.-]/g, '_').toLowerCase();
+          let uploaded = false;
+          // Un reintento cubre el corte de red momentáneo, que es la causa
+          // habitual cuando se suben tandas grandes desde el celular.
+          for (let attempt = 0; attempt < 2 && !uploaded; attempt++) {
+            try {
+              setUploadProgress(`Subiendo foto ${i + 1} de ${photos.length}...`);
+              const storageRef = ref(storage, `${baseStoragePath}/${Date.now()}_${cleanName}`);
+              await uploadBytes(storageRef, item.file);
+              uploadedUrls.push(await getDownloadURL(storageRef));
+              uploaded = true;
+            } catch (err) {
+              console.error(`Error subiendo foto ${cleanName} (intento ${attempt + 1}):`, err);
+            }
           }
+          if (!uploaded) failedPhotos.push(cleanName);
         }
       }
       setUploadProgress('');
 
+      if (failedPhotos.length > 0) {
+        setPhotoError(`No se pudieron subir ${failedPhotos.length} foto(s). Revisa tu conexión e intenta guardar de nuevo — no se guardó nada todavía.`);
+        setLoading(false);
+        return;
+      }
+
       data.images = uploadedUrls;
       data.image = uploadedUrls[0] || 'https://images.unsplash.com/photo-1533473359331-0135ef1b58bf?auto=format&fit=crop&q=80&w=800';
+      data.link_externo = linkExterno.trim() || null;
 
       if (initialData?.id) {
         data.id = initialData.id;
@@ -681,13 +936,13 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
             <div className={isLocked ? "opacity-60 pointer-events-none grayscale-[0.5] transition-all" : "transition-all"}>
               <SectionHeader title="Información Principal" icon={Car} />
               <div className="grid grid-cols-1 md:grid-cols-3 gap-x-8 gap-y-6">
-                <Input name="make" label="Marca" defaultValue={initialData?.make} placeholder="Ej. Toyota" required disabled={isLocked} />
-                <Input name="model" label="Modelo" defaultValue={initialData?.model} placeholder="Ej. Camry" required disabled={isLocked} />
+                <Input name="make" label="Marca" defaultValue={initialData?.make} placeholder="Ej. TOYOTA" required disabled={isLocked} onInput={e => { e.target.value = e.target.value.toUpperCase(); }} />
+                <Input name="model" label="Modelo" defaultValue={initialData?.model} placeholder="Ej. CAMRY" required disabled={isLocked} onInput={e => { e.target.value = e.target.value.toUpperCase(); }} />
                 {/* AÑO-small */}
                 <Input name="year" label="Año" type="number" onWheel={(e) => e.target.blur()} defaultValue={initialData?.year} placeholder="2026" required disabled={isLocked} />
 
-                <Input name="edition" label="Edición" defaultValue={initialData?.edition} placeholder="Ej. XSE" disabled={isLocked} />
-                <Input name="color" label="Color" defaultValue={initialData?.color} placeholder="Ej. Blanco Perla" required disabled={isLocked} />
+                <Input name="edition" label="Edición" defaultValue={initialData?.edition} placeholder="Ej. XSE" disabled={isLocked} onInput={e => { e.target.value = e.target.value.toUpperCase(); }} />
+                <Input name="color" label="Color" defaultValue={initialData?.color} placeholder="Ej. BLANCO PERLA" required disabled={isLocked} onInput={e => { e.target.value = e.target.value.toUpperCase(); }} />
 
                 {/* MILLAJE CON TOGGLE INTEGRADO */}
                 <div className="flex flex-col mb-4 group text-left">
@@ -761,7 +1016,13 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                   value={vinSelects.type || undefined}
                   defaultValue={initialData?.type || initialData?.bodyType || initialData?.tipo_vehiculo || '-'}
                   onChange={(e) => setVinSelects(prev => ({ ...prev, type: e.target.value }))}
-                  options={['-', 'Automóvil', 'Jeepeta', 'Camioneta', 'Moto', 'Camión', 'Bus', 'Vehículos Pesados']} disabled={isLocked} />
+                  options={[
+                    '-',
+                    { header: 'Autos' }, 'Automóvil', 'Jeepeta', 'Camioneta',
+                    { header: 'Motos' }, 'Moto', 'Scooter', 'Pasola', 'Buggy',
+                    { header: 'Vehículos Pesados' }, 'Camión', 'Camión Refrigerado', 'Camión Doble Cabina', 'Camión Cama Abierta', 'Camión Doble Cabina Refrigerado', 'Camión Plataforma', 'Camión Furgón Seco', 'Bus', 'Vehículos Pesados',
+                    { header: 'Vehículos de Construcción o Agrícolas' }, 'Tractor', 'Tractor Cabezal', 'Tractor Quinta Rueda', 'Tractor Cama Baja'
+                  ]} disabled={isLocked} />
 
                 {/* FILA 2 */}
                 <Select name="transmission" label="Transmisión"
@@ -849,8 +1110,34 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                   <div className={`flex relative items-stretch shadow-sm rounded-xl overflow-hidden border border-slate-200 focus-within:ring-2 focus-within:ring-red-500/20 focus-within:border-red-500 transition-all ${isLocked ? 'bg-slate-50' : 'bg-white'}`}>
                     <input
                       type="text"
+                      ref={priceInputRef}
                       value={formatWithCommas(prices.price)}
-                      onChange={(e) => setPrices(prev => ({ ...prev, price: parseCommaNumber(e.target.value) }))}
+                      onChange={(e) => {
+                        const cleanValue = parseCommaNumber(e.target.value);
+                        const priceNum = Number(cleanValue) || 0;
+                        pendingCursorRef.current.price = cursorPosAfterFormat(e.target.value, e.target.selectionStart, formatWithCommas(cleanValue));
+
+                        // El inicial autogenerado siempre se calcula en la moneda PRINCIPAL
+                        // del dealer (aunque el precio esté en otra) — se convierte primero
+                        // con la tasa y luego se saca el % configurado, marcado en esa moneda.
+                        let autoInitial = '';
+                        const autoPct = (rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+                        if (!leaveInitialEmpty && !initialManuallyEditedRef.current && priceNum > 0) {
+                          if (rateConfig) {
+                            const priceInPrimary = convertAmount(priceNum, currency, rateConfig.primary, rateConfig.ratesToPrimary);
+                            autoInitial = String(Math.round(priceInPrimary * autoPct));
+                            if (downPaymentCurrency !== rateConfig.primary) setDownPaymentCurrency(rateConfig.primary);
+                          } else {
+                            autoInitial = String(Math.round(priceNum * autoPct));
+                          }
+                        }
+
+                        setPrices(prev => {
+                          const next = { ...prev, price: cleanValue };
+                          if (!leaveInitialEmpty && !initialManuallyEditedRef.current) next.initial = autoInitial;
+                          return next;
+                        });
+                      }}
                       className="flex-1 min-w-0 px-4 py-3 bg-transparent focus:outline-none font-bold text-slate-800 placeholder:text-slate-300 text-sm"
                       placeholder="0.00"
                       required
@@ -880,11 +1167,17 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                   <div className={`flex relative items-stretch shadow-sm rounded-xl overflow-hidden border border-slate-200 focus-within:ring-2 focus-within:ring-red-500/20 focus-within:border-red-500 transition-all ${isLocked ? 'bg-slate-50' : 'bg-white'}`}>
                     <input
                       type="text"
+                      ref={initialInputRef}
                       value={formatWithCommas(prices.initial)}
-                      onChange={(e) => setPrices(prev => ({ ...prev, initial: parseCommaNumber(e.target.value) }))}
+                      onChange={(e) => {
+                        initialManuallyEditedRef.current = true;
+                        const cleanValue = parseCommaNumber(e.target.value);
+                        pendingCursorRef.current.initial = cursorPosAfterFormat(e.target.value, e.target.selectionStart, formatWithCommas(cleanValue));
+                        setPrices(prev => ({ ...prev, initial: cleanValue }));
+                      }}
                       className="flex-1 min-w-0 px-4 py-3 bg-transparent focus:outline-none font-bold text-slate-800 placeholder:text-slate-300 text-sm"
                       placeholder="0.00"
-                      disabled={isLocked}
+                      disabled={isLocked || leaveInitialEmpty}
                     />
                     <div className="bg-slate-50 flex p-1 items-center border-l border-slate-200 shrink-0">
                       <div className="flex p-0.5 rounded-lg bg-slate-200/50">
@@ -902,6 +1195,37 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                       </div>
                     </div>
                   </div>
+                  <label className="flex items-center gap-2 mt-2 ml-1 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={leaveInitialEmpty}
+                      disabled={isLocked}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setLeaveInitialEmpty(checked);
+                        if (checked) {
+                          initialManuallyEditedRef.current = true;
+                          setPrices(prev => ({ ...prev, initial: '' }));
+                        } else {
+                          initialManuallyEditedRef.current = false;
+                          const autoPct = (rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+                          setPrices(prev => {
+                            if (prev.initial) return prev;
+                            const priceNum = Number(prev.price) || 0;
+                            if (priceNum <= 0) return prev;
+                            if (rateConfig) {
+                              const priceInPrimary = convertAmount(priceNum, currency, rateConfig.primary, rateConfig.ratesToPrimary);
+                              if (downPaymentCurrency !== rateConfig.primary) setDownPaymentCurrency(rateConfig.primary);
+                              return { ...prev, initial: String(Math.round(priceInPrimary * autoPct)) };
+                            }
+                            return { ...prev, initial: String(Math.round(priceNum * autoPct)) };
+                          });
+                        }
+                      }}
+                      className="w-3.5 h-3.5 rounded accent-red-600"
+                    />
+                    <span className="text-[10px] font-bold text-slate-400">¿Dejar el inicial vacío?</span>
+                  </label>
                 </div>
 
                 {/* ESTADO */}
@@ -996,12 +1320,79 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                   </div>
                 ))}
               </div>
+              {photoError && (
+                <p className="text-xs font-bold text-red-600 mt-1">{photoError}</p>
+              )}
+
+              {/* OPTIMIZACIÓN DE FOTOS */}
+              {isOptimizing && photoProgress.total > 0 && (
+                <div className="mt-2">
+                  <div className="flex items-center justify-between gap-2 mb-1.5">
+                    <span className="flex items-center gap-2 text-xs font-bold text-slate-500">
+                      <Loader2 size={14} className="animate-spin" />
+                      Optimizando fotos…
+                    </span>
+                    <span className="text-xs font-black text-slate-600 tabular-nums">
+                      {photoProgress.done} / {photoProgress.total}
+                    </span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-slate-200 overflow-hidden">
+                    <div
+                      className="h-full bg-red-600 rounded-full transition-all duration-300"
+                      style={{ width: `${Math.round((photoProgress.done / photoProgress.total) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
               {/* PROGRESS BAR */}
               {uploadProgress && (
                 <div className="flex items-center gap-2 text-xs font-bold text-slate-500 animate-pulse">
                   <Loader2 size={14} className="animate-spin" /> {uploadProgress}
                 </div>
               )}
+
+              {/* LINK EXTERNO */}
+              <div
+                className="relative rounded-3xl overflow-hidden mt-4"
+                style={{ background: 'linear-gradient(135deg, rgba(220,38,38,0.12) 0%, rgba(220,38,38,0.04) 50%, rgba(0,0,0,0.08) 100%)', border: '1.5px solid rgba(220,38,38,0.25)' }}
+              >
+                {/* Glow accent */}
+                <div className="absolute top-0 left-0 w-32 h-32 rounded-full pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(220,38,38,0.15) 0%, transparent 70%)', transform: 'translate(-30%, -30%)' }} />
+
+                <div className="relative p-6">
+                  {/* Header */}
+                  <div className="flex items-center gap-3 mb-5">
+                    <div className="p-2 rounded-xl bg-red-600 shadow-lg shadow-red-600/30">
+                      <Link size={14} className="text-white" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-black uppercase tracking-widest text-red-500 leading-none">
+                        Link de Fotos
+                      </h3>
+                      <p className="text-[10px] font-bold mt-0.5" style={{ color: 'var(--text-tertiary)' }}>
+                        Instagram, Google Drive, etc. — el bot lo comparte en vez del catálogo
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Input */}
+                  <input
+                    type="url"
+                    value={linkExterno}
+                    onChange={e => setLinkExterno(e.target.value)}
+                    disabled={isLocked}
+                    placeholder="https://instagram.com/p/…"
+                    className="w-full px-4 py-3 rounded-2xl font-bold text-sm focus:outline-none transition-all disabled:opacity-60"
+                    style={{
+                      backgroundColor: 'var(--input-bg)',
+                      borderWidth: '2px',
+                      borderColor: 'var(--input-border)',
+                      color: 'var(--text-primary)',
+                    }}
+                  />
+                </div>
+              </div>
             </div>
 
             {/* Spacer for mobile safe area */}
@@ -1490,11 +1881,14 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
   const [clientPhone, setClientPhone] = useState('');
   const [clientEmail, setClientEmail] = useState('');
   const [bankName, setBankName] = useState('');
+  const [warrantyValue, setWarrantyValue] = useState(12);
+  const [warrantyUnit, setWarrantyUnit] = useState('meses');
   const [loading, setLoading] = useState(false);
   const [ghlTemplates, setGhlTemplates] = useState([]);
   const [ghlToken, setGhlToken] = useState('');
   const [successData, setSuccessData] = useState(null);
   const [submitted, setSubmitted] = useState(false);
+  const persistedRef = useRef(false); // evita doble persistencia (generar + cerrar)
   const documentType = initialDocumentType; // Viene del modal de acción: 'cotizacion' | 'contrato'
 
 
@@ -1674,6 +2068,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       setClientPhone(String(initialVehicle.phone || initialVehicle.tel || ''));
       setClientEmail(initialVehicle.email || initialVehicle.mail || '');
       setBankName(initialVehicle.bankName || initialVehicle.bank || initialVehicle.banco || '');
+      setWarrantyValue(Number(initialVehicle.warrantyValue || initialVehicle.tiempo_garantia_valor) || 12);
+      setWarrantyUnit(initialVehicle.warrantyUnit || initialVehicle.tiempo_garantia_unidad || 'meses');
 
       // Auto-fill price/downPayment from initial data or the vehicle in inventory
       const v = inventory.find(i => String(i.id) === String(initialVehicle.vehicleId || initialVehicle.id));
@@ -1703,6 +2099,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       setClientEmail('');
       setClientCedula('');
       setBankName('');
+      setWarrantyValue(12);
+      setWarrantyUnit('meses');
       setFinalPrice('');
       setDownPayment('');
       setSuccessData(null);
@@ -1761,6 +2159,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       const vehicle = inventory.find(v => String(v.id) === String(selectedVehicleId));
       if (!vehicle) throw new Error("Vehículo no encontrado en el inventario actual");
 
+      const warrantyUnitLabel = { dias: warrantyValue === 1 ? 'Día' : 'Días', meses: warrantyValue === 1 ? 'Mes' : 'Meses', anos: warrantyValue === 1 ? 'Año' : 'Años' }[warrantyUnit] || 'Meses';
+
       const cliente = {
         nombre: clientName,
         apellido: clientLastName,
@@ -1771,7 +2171,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
         precioFinal: finalPrice,
         inicial: downPayment,
         monedaVenta: priceCurrency,
-        monedaInicial: inicialCurrency
+        monedaInicial: inicialCurrency,
+        tiempoGarantia: `${warrantyValue} ${warrantyUnitLabel}`
       };
 
       // GHL Location ID resolution
@@ -1843,8 +2244,24 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
         showToast(`Se guardó el contrato localmente. Problema en CarBotSystem: ${errors[0]}`, "warning");
       }
 
-      // Se pospone el onGenerate persistencia física hasta que se cierra el modal
-      // para evitar que el estado cambie brusco y recargue las animaciones.
+      // PERSISTENCIA INMEDIATA: guardar el documento + marcar el vehículo como
+      // Vendido/Cotizado en cuanto la generación es exitosa, NO al cerrar el modal.
+      // (Antes se posponía al botón "Cerrar"; en móvil, cerrar con la X o salir tras
+      //  "Ver Documento" dejaba la venta sin guardar.)
+      if (results.length > 0 && onGenerate && !persistedRef.current) {
+        persistedRef.current = true;
+        onGenerate({
+          vehicleId: selectedVehicleId,
+          documentType,
+          clientData: { name: clientName, lastName: clientLastName, cedula: clientCedula, phone: clientPhone, email: clientEmail },
+          templateIds: selectedTemplates,
+          bankName,
+          warrantyValue,
+          warrantyUnit,
+          finalPrice: finalPrice,
+          ghlDocumentUrls: results.map(r => r?.documentUrl || r),
+        });
+      }
 
       if (results.length === 0) {
         onClose();
@@ -1953,13 +2370,18 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
               )}
               <Button
                 onClick={() => {
-                  if (onGenerate && successData) {
+                  // La persistencia ya ocurrió al generar (persistedRef). Fallback defensivo
+                  // por si por alguna razón no se ejecutó: garantizar el guardado al cerrar.
+                  if (onGenerate && successData && !persistedRef.current) {
+                    persistedRef.current = true;
                     onGenerate({
                       vehicleId: selectedVehicleId,
                       documentType,
                       clientData: { name: clientName, lastName: clientLastName, cedula: clientCedula, phone: clientPhone, email: clientEmail },
                       templateIds: selectedTemplates,
                       bankName,
+                      warrantyValue,
+                      warrantyUnit,
                       finalPrice: finalPrice,
                       ghlDocumentUrls: successData.documentUrls
                     });
@@ -2272,6 +2694,29 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                       value={bankName}
                       onChange={(e) => setBankName(e.target.value.toUpperCase())}
                     />
+
+                    <div className="space-y-2 mb-4">
+                      <label className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 flex items-center gap-1.5">
+                        <Clock size={12} /> TIEMPO DE GARANTÍA
+                      </label>
+                      <div className="flex items-stretch gap-3 p-4 bg-white rounded-2xl border-2 border-slate-100 shadow-sm">
+                        <WheelPicker
+                          items={Array.from({ length: 100 }, (_, i) => ({ value: i + 1, label: String(i + 1) }))}
+                          value={warrantyValue}
+                          onChange={setWarrantyValue}
+                        />
+                        <WheelPicker
+                          items={[
+                            { value: 'dias', label: warrantyValue === 1 ? 'Día' : 'Días' },
+                            { value: 'meses', label: warrantyValue === 1 ? 'Mes' : 'Meses' },
+                            { value: 'anos', label: warrantyValue === 1 ? 'Año' : 'Años' },
+                          ]}
+                          value={warrantyUnit}
+                          onChange={setWarrantyUnit}
+                        />
+                      </div>
+                    </div>
+
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="space-y-2">
                         <label className={`text-[10px] font-black uppercase tracking-[0.2em] ${submitted && (!finalPrice || finalPrice <= 0) ? 'text-red-500' : 'text-slate-500'}`}>
@@ -3620,28 +4065,1062 @@ const ConfirmationModal = ({ isOpen, onClose, onConfirm, title, message, confirm
 
 
 // --- SETTINGS VIEW ---
-const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDisconnectGhl, onShowDealerSwitcher, isSuperAdmin }) => {
+const ChangePasswordCard = ({ userProfile, showToast, t }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [currentPw, setCurrentPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [confirmPw, setConfirmPw] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const reset = () => {
+    setIsOpen(false);
+    setCurrentPw('');
+    setNewPw('');
+    setConfirmPw('');
+    setError('');
+  };
+
+  const handleSubmit = async () => {
+    setError('');
+    if (!currentPw) return setError('Ingresa tu contraseña actual.');
+    if (newPw.length < 8) return setError('La nueva contraseña debe tener al menos 8 caracteres.');
+    if (newPw !== confirmPw) return setError('Las contraseñas nuevas no coinciden.');
+
+    setLoading(true);
+    try {
+      const { error: verifyErr } = await supabase.auth.signInWithPassword({
+        email: userProfile?.email,
+        password: currentPw,
+      });
+      if (verifyErr) throw new Error('La contraseña actual es incorrecta.');
+
+      const { error: updErr } = await supabase.auth.updateUser({ password: newPw });
+      if (updErr) throw updErr;
+
+      showToast?.('Contraseña actualizada.');
+      reset();
+    } catch (err) {
+      setError(err.message || 'Error al cambiar la contraseña.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!isOpen) {
+    return (
+      <div className="glass-card rounded-2xl p-5 flex items-center justify-between" style={{ borderRadius: '20px' }}>
+        <div className="flex items-center gap-4">
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'rgba(16, 185, 129, 0.12)', color: '#10B981' }}>
+            <ShieldCheck size={18} strokeWidth={2.5} />
+          </div>
+          <div>
+            <p className="text-[9px] font-bold tracking-wider uppercase" style={{ color: 'var(--text-tertiary)' }}>{t('password_label')}</p>
+            <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>••••••••</p>
+          </div>
+        </div>
+        <button
+          onClick={() => setIsOpen(true)}
+          className="px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wide transition-all active:scale-95"
+          style={{ background: 'var(--input-bg)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)' }}
+        >
+          Cambiar
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="glass-card rounded-2xl p-5 space-y-3" style={{ borderRadius: '20px' }}>
+      <div className="flex items-center justify-between mb-1">
+        <p className="text-[10px] font-bold tracking-wider uppercase" style={{ color: 'var(--text-secondary)' }}>{t('changePassword')}</p>
+        <button onClick={reset} className="p-1 rounded-lg" style={{ color: 'var(--text-tertiary)' }}><X size={16} /></button>
+      </div>
+      <input
+        type="password"
+        placeholder="Contraseña actual"
+        value={currentPw}
+        onChange={(e) => setCurrentPw(e.target.value)}
+        className="glass-input w-full px-4 py-3 text-sm font-bold"
+        autoComplete="current-password"
+      />
+      <input
+        type="password"
+        placeholder="Nueva contraseña (mínimo 8 caracteres)"
+        value={newPw}
+        onChange={(e) => setNewPw(e.target.value)}
+        className="glass-input w-full px-4 py-3 text-sm font-bold"
+        autoComplete="new-password"
+      />
+      <input
+        type="password"
+        placeholder="Confirmar nueva contraseña"
+        value={confirmPw}
+        onChange={(e) => setConfirmPw(e.target.value)}
+        className="glass-input w-full px-4 py-3 text-sm font-bold"
+        autoComplete="new-password"
+      />
+      {error && <p className="text-xs font-bold" style={{ color: 'var(--accent)' }}>{error}</p>}
+      <button
+        onClick={handleSubmit}
+        disabled={loading}
+        className="w-full py-3 rounded-2xl font-black text-sm transition-all active:scale-[0.98] disabled:opacity-50"
+        style={{ background: 'var(--accent)', color: '#fff', boxShadow: 'var(--accent-glow)' }}
+      >
+        {loading ? 'Guardando…' : 'Actualizar Contraseña'}
+      </button>
+    </div>
+  );
+};
+
+const FINANCING_TERM_OPTIONS = [6, 12, 24, 36, 48, 72];
+
+const FinancingBanksCard = ({ userProfile, showToast, embedded }) => {
+  const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+  const [banks, setBanks] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const emptyForm = { banco: '', tasa_anual: '', max_financiamiento_pct: '80', plazo_maximo_meses: '48' };
+  const [form, setForm] = useState(emptyForm);
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState(emptyForm);
+
+  const loadBanks = useCallback(async () => {
+    if (!dealerId) { setLoading(false); return; }
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('dealer_financing_banks')
+      .select('*')
+      .eq('dealer_id', dealerId)
+      .order('orden', { ascending: true });
+    if (error) {
+      console.error('Error cargando bancos de financiamiento:', error);
+    } else {
+      setBanks(data || []);
+    }
+    setLoading(false);
+  }, [dealerId]);
+
+  useEffect(() => { loadBanks(); }, [loadBanks]);
+
+  const resetForm = () => { setForm(emptyForm); setShowForm(false); };
+
+  const handleAddBank = async () => {
+    const tasa = parseFloat(form.tasa_anual);
+    const maxPct = parseFloat(form.max_financiamiento_pct);
+    const plazo = parseInt(form.plazo_maximo_meses, 10);
+    if (!form.banco.trim()) return showToast('Ingresa el nombre del banco.');
+    if (!(tasa > 0 && tasa < 100)) return showToast('La tasa anual debe ser un número entre 0 y 100.');
+    if (!(maxPct > 0 && maxPct <= 100)) return showToast('El % máximo a financiar debe estar entre 1 y 100.');
+
+    setSaving(true);
+    const { error } = await supabase.from('dealer_financing_banks').insert({
+      dealer_id: dealerId,
+      banco: form.banco.trim(),
+      tasa_anual: tasa,
+      max_financiamiento_pct: maxPct,
+      plazo_maximo_meses: plazo,
+      orden: banks.length,
+    });
+    setSaving(false);
+    if (error) {
+      console.error('Error guardando banco:', error);
+      showToast('No se pudo guardar el banco.');
+      return;
+    }
+    showToast('Banco agregado.');
+    resetForm();
+    loadBanks();
+  };
+
+  const handleToggleActivo = async (bank) => {
+    const { error } = await supabase.from('dealer_financing_banks').update({ activo: !bank.activo }).eq('id', bank.id);
+    if (error) { showToast('No se pudo actualizar el banco.'); return; }
+    setBanks(prev => prev.map(b => b.id === bank.id ? { ...b, activo: !b.activo } : b));
+  };
+
+  const startEdit = (bank) => {
+    setShowForm(false);
+    setEditingId(bank.id);
+    setEditForm({
+      banco: bank.banco,
+      tasa_anual: String(bank.tasa_anual),
+      max_financiamiento_pct: String(bank.max_financiamiento_pct),
+      plazo_maximo_meses: String(bank.plazo_maximo_meses),
+    });
+  };
+
+  const cancelEdit = () => { setEditingId(null); setEditForm(emptyForm); };
+
+  const handleUpdateBank = async () => {
+    const tasa = parseFloat(editForm.tasa_anual);
+    const maxPct = parseFloat(editForm.max_financiamiento_pct);
+    const plazo = parseInt(editForm.plazo_maximo_meses, 10);
+    if (!editForm.banco.trim()) return showToast('Ingresa el nombre del banco.');
+    if (!(tasa > 0 && tasa < 100)) return showToast('La tasa anual debe ser un número entre 0 y 100.');
+    if (!(maxPct > 0 && maxPct <= 100)) return showToast('El % máximo a financiar debe estar entre 1 y 100.');
+
+    setSaving(true);
+    const { error } = await supabase.from('dealer_financing_banks').update({
+      banco: editForm.banco.trim(),
+      tasa_anual: tasa,
+      max_financiamiento_pct: maxPct,
+      plazo_maximo_meses: plazo,
+    }).eq('id', editingId);
+    setSaving(false);
+    if (error) {
+      console.error('Error actualizando banco:', error);
+      showToast('No se pudo actualizar el banco.');
+      return;
+    }
+    setBanks(prev => prev.map(b => b.id === editingId ? { ...b, banco: editForm.banco.trim(), tasa_anual: tasa, max_financiamiento_pct: maxPct, plazo_maximo_meses: plazo } : b));
+    showToast('Banco actualizado.');
+    cancelEdit();
+  };
+
+  const handleDelete = async (bank) => {
+    if (!window.confirm(`¿Eliminar ${bank.banco} de las opciones de financiamiento?`)) return;
+    const { error } = await supabase.from('dealer_financing_banks').delete().eq('id', bank.id);
+    if (error) { showToast('No se pudo eliminar el banco.'); return; }
+    setBanks(prev => prev.filter(b => b.id !== bank.id));
+    showToast('Banco eliminado.');
+  };
+
+  if (!dealerId) return null;
+
+  return (
+    <div className={embedded ? '' : 'glass-card rounded-2xl p-5'} style={embedded ? undefined : { borderRadius: '20px' }}>
+      <div className="flex items-center justify-between mb-1">
+        {embedded ? (
+          <p className="text-[11px] font-medium flex-1" style={{ color: 'var(--text-tertiary)' }}>
+            Bancos y tasas reales que ven tus clientes en la calculadora de cuotas de cada vehículo.
+          </p>
+        ) : (
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background: 'rgba(16, 185, 129, 0.12)', color: '#10B981' }}>
+              <CreditCard size={18} strokeWidth={2.5} />
+            </div>
+            <div>
+              <p className="text-[9px] font-bold tracking-wider uppercase" style={{ color: 'var(--text-tertiary)' }}>Financiamiento</p>
+              <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>Bancos y Tasas</p>
+            </div>
+          </div>
+        )}
+        {!showForm && (
+          <button
+            onClick={() => { cancelEdit(); setShowForm(true); }}
+            className="px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wide transition-all active:scale-95 shrink-0"
+            style={{ background: 'var(--input-bg)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)' }}
+          >
+            + Banco
+          </button>
+        )}
+      </div>
+      {!embedded && (
+        <p className="text-[11px] font-medium mt-2 mb-4" style={{ color: 'var(--text-tertiary)' }}>
+          Estos bancos y tasas reales aparecen en la calculadora de cuotas que ven tus clientes en la ficha pública de cada vehículo.
+        </p>
+      )}
+      {embedded && <div className="mt-3" />}
+
+      {loading ? (
+        <p className="text-xs font-medium" style={{ color: 'var(--text-tertiary)' }}>Cargando…</p>
+      ) : (
+        <div className="space-y-2">
+          {banks.length === 0 && !showForm && (
+            <p className="text-xs font-medium" style={{ color: 'var(--text-tertiary)' }}>Aún no has agregado bancos. Sin bancos, tus clientes no verán la calculadora de cuotas.</p>
+          )}
+          {banks.map(bank => (
+            editingId === bank.id ? (
+              <div key={bank.id} className="p-4 rounded-2xl space-y-3" style={{ background: 'var(--input-bg)', border: '1px solid var(--accent)' }}>
+                <input
+                  placeholder="Nombre del banco"
+                  value={editForm.banco}
+                  onChange={(e) => setEditForm(f => ({ ...f, banco: e.target.value }))}
+                  className="glass-input w-full px-4 py-3 text-sm font-bold"
+                />
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>Tasa Anual %</label>
+                    <input
+                      type="number" step="0.01" placeholder="16.50"
+                      value={editForm.tasa_anual}
+                      onChange={(e) => setEditForm(f => ({ ...f, tasa_anual: e.target.value }))}
+                      className="glass-input w-full px-3 py-2.5 text-sm font-bold"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>% Máx. Financiar</label>
+                    <input
+                      type="number" step="1" placeholder="80"
+                      value={editForm.max_financiamiento_pct}
+                      onChange={(e) => setEditForm(f => ({ ...f, max_financiamiento_pct: e.target.value }))}
+                      className="glass-input w-full px-3 py-2.5 text-sm font-bold"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>Plazo Máx.</label>
+                    <select
+                      value={editForm.plazo_maximo_meses}
+                      onChange={(e) => setEditForm(f => ({ ...f, plazo_maximo_meses: e.target.value }))}
+                      className="glass-input w-full px-3 py-2.5 text-sm font-bold"
+                    >
+                      {FINANCING_TERM_OPTIONS.map(m => <option key={m} value={m}>{m} meses</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={cancelEdit} className="flex-1 py-2.5 rounded-xl text-xs font-bold" style={{ background: 'var(--input-border)', color: 'var(--text-secondary)' }}>
+                    Cancelar
+                  </button>
+                  <button
+                    onClick={handleUpdateBank}
+                    disabled={saving}
+                    className="flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-wide disabled:opacity-50"
+                    style={{ background: 'var(--accent)', color: '#fff' }}
+                  >
+                    {saving ? 'Guardando…' : 'Guardar Cambios'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div key={bank.id} className="flex items-center gap-3 px-4 py-3 rounded-2xl" style={{ background: 'var(--input-bg)', opacity: bank.activo ? 1 : 0.5 }}>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-bold truncate" style={{ color: 'var(--text-primary)' }}>{bank.banco}</p>
+                  <p className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
+                    {bank.tasa_anual}% anual · hasta {bank.max_financiamiento_pct}% financiado · máx. {bank.plazo_maximo_meses} meses
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleToggleActivo(bank)}
+                  className="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wide"
+                  style={bank.activo ? { background: 'rgba(16,185,129,0.12)', color: '#10B981' } : { background: 'var(--input-border)', color: 'var(--text-tertiary)' }}
+                >
+                  {bank.activo ? 'Activo' : 'Inactivo'}
+                </button>
+                <button onClick={() => startEdit(bank)} className="p-2 rounded-lg" style={{ color: 'var(--text-tertiary)' }}>
+                  <Edit size={14} />
+                </button>
+                <button onClick={() => handleDelete(bank)} className="p-2 rounded-lg" style={{ color: 'var(--text-tertiary)' }}>
+                  <Trash size={14} />
+                </button>
+              </div>
+            )
+          ))}
+
+          {showForm && (
+            <div className="p-4 rounded-2xl space-y-3" style={{ background: 'var(--input-bg)', border: '1px solid var(--border-glass)' }}>
+              <input
+                placeholder="Nombre del banco (ej. Banco Popular)"
+                value={form.banco}
+                onChange={(e) => setForm(f => ({ ...f, banco: e.target.value }))}
+                className="glass-input w-full px-4 py-3 text-sm font-bold"
+              />
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>Tasa Anual %</label>
+                  <input
+                    type="number" step="0.01" placeholder="16.50"
+                    value={form.tasa_anual}
+                    onChange={(e) => setForm(f => ({ ...f, tasa_anual: e.target.value }))}
+                    className="glass-input w-full px-3 py-2.5 text-sm font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>% Máx. Financiar</label>
+                  <input
+                    type="number" step="1" placeholder="80"
+                    value={form.max_financiamiento_pct}
+                    onChange={(e) => setForm(f => ({ ...f, max_financiamiento_pct: e.target.value }))}
+                    className="glass-input w-full px-3 py-2.5 text-sm font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>Plazo Máx.</label>
+                  <select
+                    value={form.plazo_maximo_meses}
+                    onChange={(e) => setForm(f => ({ ...f, plazo_maximo_meses: e.target.value }))}
+                    className="glass-input w-full px-3 py-2.5 text-sm font-bold"
+                  >
+                    {FINANCING_TERM_OPTIONS.map(m => <option key={m} value={m}>{m} meses</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={resetForm} className="flex-1 py-2.5 rounded-xl text-xs font-bold" style={{ background: 'var(--input-border)', color: 'var(--text-secondary)' }}>
+                  Cancelar
+                </button>
+                <button
+                  onClick={handleAddBank}
+                  disabled={saving}
+                  className="flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-wide disabled:opacity-50"
+                  style={{ background: 'var(--accent)', color: '#fff' }}
+                >
+                  {saving ? 'Guardando…' : 'Guardar Banco'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const WhatsAppContactCard = ({ userProfile, showToast }) => {
+  const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+  const [value, setValue] = useState('');
+  const [savedValue, setSavedValue] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!dealerId) { setLoading(false); return; }
+    (async () => {
+      const { data, error } = await supabase.from('dealers').select('phone, whatsapp_link').eq('id', dealerId).single();
+      if (!error && data) {
+        const current = data.whatsapp_link || data.phone || '';
+        setValue(current);
+        setSavedValue(current);
+      }
+      setLoading(false);
+    })();
+  }, [dealerId]);
+
+  const isDirty = value.trim() !== savedValue.trim();
+
+  const handleSave = async () => {
+    if (!dealerId) return;
+    const trimmed = value.trim();
+    let update;
+    if (!trimmed) {
+      update = { phone: null, whatsapp_link: null };
+    } else if (/^https?:\/\//i.test(trimmed)) {
+      update = { whatsapp_link: trimmed, phone: null };
+    } else {
+      update = { phone: trimmed.replace(/[^\d+]/g, ''), whatsapp_link: null };
+    }
+
+    setSaving(true);
+    // .select() para poder distinguir "RLS bloqueó el UPDATE" (0 filas, sin error)
+    // de un guardado real — sin esto, un bloqueo de permisos pasa desapercibido.
+    const { data, error } = await supabase.from('dealers').update(update).eq('id', dealerId).select();
+    if (userProfile?.dealerId) {
+      try {
+        const dealerRef = doc(db, "Dealers", userProfile.dealerId);
+        await setDoc(dealerRef, update, { merge: true });
+      } catch (err) {
+        console.warn('Firestore WhatsApp sync omitido:', err);
+      }
+    }
+    setSaving(false);
+    if (error || !data?.length) {
+      showToast('No se pudo guardar el WhatsApp.');
+      return;
+    }
+    const normalized = update.whatsapp_link || update.phone || '';
+    setValue(normalized);
+    setSavedValue(normalized);
+    showToast('WhatsApp actualizado.');
+  };
+
+  if (!dealerId) return null;
+
+  return (
+    <div className="glass-card rounded-2xl p-5" style={{ borderRadius: '20px' }}>
+      <div className="flex items-center gap-3 mb-3">
+        <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background: 'rgba(37,211,102,0.12)', color: '#25D366' }}>
+          <MessageCircle size={18} strokeWidth={2.5} />
+        </div>
+        <div>
+          <p className="text-[9px] font-bold tracking-wider uppercase" style={{ color: 'var(--text-tertiary)' }}>Contacto</p>
+          <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>WhatsApp</p>
+        </div>
+      </div>
+      <p className="text-[11px] font-medium mb-3" style={{ color: 'var(--text-tertiary)' }}>
+        Número (ej. 8095551234) o link completo (ej. https://wa.me/18095551234). Se usa en el botón "Contacta por WhatsApp" de cada vehículo.
+      </p>
+      {loading ? (
+        <p className="text-xs font-medium" style={{ color: 'var(--text-tertiary)' }}>Cargando…</p>
+      ) : (
+        <div className="flex gap-2">
+          <input
+            placeholder="8095551234 o https://wa.me/..."
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            className="glass-input flex-1 px-4 py-3 text-sm font-bold"
+          />
+          <button
+            onClick={handleSave}
+            disabled={saving || !isDirty}
+            className="px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wide transition-all active:scale-95 disabled:opacity-40"
+            style={{ background: 'var(--accent)', color: '#fff' }}
+          >
+            {saving ? '...' : 'Guardar'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const DEALER_API_ENDPOINT = 'https://lpiwkennlavpzisdvnnh.supabase.co/functions/v1/inventory-search';
+
+const DealerApiKeyCard = ({ userProfile, showToast }) => {
+  const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+  const [loading, setLoading] = useState(true);
+  const [rotating, setRotating] = useState(false);
+  const [hasKey, setHasKey] = useState(false);
+  const [lastUsedAt, setLastUsedAt] = useState(null);
+  const [revealedKey, setRevealedKey] = useState('');
+
+  const callDealerApiKey = async (action) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session?.access_token) throw new Error('Sesión no disponible.');
+    const res = await fetch('https://lpiwkennlavpzisdvnnh.supabase.co/functions/v1/dealer-api-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({ action }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || 'Error de servidor.');
+    return data;
+  };
+
+  useEffect(() => {
+    if (!dealerId) { setLoading(false); return; }
+    (async () => {
+      try {
+        const data = await callDealerApiKey('status');
+        setHasKey(!!data.has_key);
+        setLastUsedAt(data.last_used_at || null);
+      } catch (err) {
+        console.warn('No se pudo cargar el estado de la API key:', err.message);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [dealerId]);
+
+  const handleRotate = async () => {
+    const confirmMsg = hasKey
+      ? '¿Regenerar la llave? La anterior dejará de funcionar de inmediato — tendrás que actualizarla donde la estés usando.'
+      : '¿Generar una llave de API para este dealer?';
+    if (!window.confirm(confirmMsg)) return;
+    setRotating(true);
+    try {
+      const data = await callDealerApiKey('rotate');
+      setRevealedKey(data.api_key);
+      setHasKey(true);
+      setLastUsedAt(null);
+      showToast('Llave generada.');
+    } catch (err) {
+      showToast(err.message || 'No se pudo generar la llave.');
+    } finally {
+      setRotating(false);
+    }
+  };
+
+  const copyToClipboard = (text, label) => {
+    navigator.clipboard.writeText(text);
+    showToast(`${label} copiado.`);
+  };
+
+  if (!dealerId) return null;
+
+  const curlSnippet = `curl -X POST '${DEALER_API_ENDPOINT}' \\\n  -H 'Authorization: Bearer ${revealedKey || 'TU_LLAVE_AQUI'}' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"dealer_id":"${dealerId}"}'`;
+
+  return (
+    <div>
+      <p className="text-[11px] font-medium mb-3" style={{ color: 'var(--text-tertiary)' }}>
+        Genera una llave para consultar tu inventario disponible (con fotos y detalles) desde tu propia web u otra herramienta.
+      </p>
+
+      <div className="p-3 rounded-xl mb-3 space-y-1" style={{ background: 'var(--input-bg)' }}>
+        <p className="text-[9px] font-bold uppercase tracking-wide" style={{ color: 'var(--text-tertiary)' }}>Endpoint (POST)</p>
+        <div className="flex items-center gap-2">
+          <code className="text-[11px] font-mono flex-1 truncate" style={{ color: 'var(--text-primary)' }}>{DEALER_API_ENDPOINT}</code>
+          <button onClick={() => copyToClipboard(DEALER_API_ENDPOINT, 'Endpoint')} className="p-1.5 rounded-lg shrink-0" style={{ color: 'var(--text-tertiary)' }}><Copy size={13} /></button>
+        </div>
+        <p className="text-[9px] font-bold uppercase tracking-wide pt-2" style={{ color: 'var(--text-tertiary)' }}>Tu dealer_id</p>
+        <div className="flex items-center gap-2">
+          <code className="text-[11px] font-mono flex-1 truncate" style={{ color: 'var(--text-primary)' }}>{dealerId}</code>
+          <button onClick={() => copyToClipboard(dealerId, 'dealer_id')} className="p-1.5 rounded-lg shrink-0" style={{ color: 'var(--text-tertiary)' }}><Copy size={13} /></button>
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="text-xs font-medium" style={{ color: 'var(--text-tertiary)' }}>Cargando…</p>
+      ) : (
+        <>
+          {revealedKey && (
+            <div className="p-3 rounded-xl mb-3" style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.3)' }}>
+              <p className="text-[10px] font-bold mb-2" style={{ color: '#10B981' }}>Cópiala ahora — no se volverá a mostrar completa.</p>
+              <div className="flex items-center gap-2">
+                <code className="text-[11px] font-mono flex-1 break-all" style={{ color: 'var(--text-primary)' }}>{revealedKey}</code>
+                <button onClick={() => copyToClipboard(revealedKey, 'Llave')} className="p-1.5 rounded-lg shrink-0" style={{ color: '#10B981' }}><Copy size={13} /></button>
+              </div>
+              <button onClick={() => setRevealedKey('')} className="mt-2 text-[10px] font-bold uppercase tracking-wide" style={{ color: 'var(--text-tertiary)' }}>Ya la copié, ocultar</button>
+            </div>
+          )}
+
+          <div className="flex items-center gap-3 mb-3">
+            <span className="text-[11px] font-medium" style={{ color: hasKey ? '#10B981' : 'var(--text-tertiary)' }}>
+              {hasKey ? `Llave activa${lastUsedAt ? ` · último uso ${new Date(lastUsedAt).toLocaleDateString('es-DO')}` : ' · sin uso todavía'}` : 'Aún no has generado una llave.'}
+            </span>
+          </div>
+
+          <button
+            onClick={handleRotate}
+            disabled={rotating}
+            className="px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wide transition-all active:scale-95 disabled:opacity-50"
+            style={hasKey ? { background: 'var(--input-bg)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)' } : { background: 'var(--accent)', color: '#fff', boxShadow: 'var(--accent-glow)' }}
+          >
+            {rotating ? 'Generando…' : hasKey ? 'Regenerar Llave' : 'Generar Llave'}
+          </button>
+
+          <details className="mt-4">
+            <summary className="text-[10px] font-bold uppercase tracking-wide cursor-pointer" style={{ color: 'var(--text-tertiary)' }}>Ejemplo de uso (curl)</summary>
+            <pre className="mt-2 p-3 rounded-xl text-[10px] font-mono overflow-x-auto whitespace-pre-wrap break-all" style={{ background: 'var(--input-bg)', color: 'var(--text-secondary)' }}>{curlSnippet}</pre>
+          </details>
+        </>
+      )}
+    </div>
+  );
+};
+
+const CurrencyDropdownField = ({ label, value, onChange, excludeCode, CURR_MAP, CURR_CODES }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const c = CURR_MAP[value];
+
+  return (
+    <div ref={ref} className="relative flex-1 min-w-0">
+      <label className="block text-[9px] font-bold tracking-wider uppercase mb-2 px-1" style={{ color: 'var(--text-tertiary)' }}>{label}</label>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="glass-card w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl transition-all"
+        style={{ borderRadius: '16px', border: `2px solid ${open ? 'var(--accent)' : 'transparent'}` }}
+      >
+        <span className="text-xl">{c?.flag}</span>
+        <div className="flex-1 text-left min-w-0">
+          <p className="text-sm font-bold truncate" style={{ color: 'var(--text-primary)' }}>{c ? `${c.symbol} ${value}` : 'Seleccionar'}</p>
+        </div>
+        <ChevronDown size={16} style={{ color: 'var(--text-tertiary)', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
+      </button>
+      {open && (
+        <div className="absolute z-20 mt-2 w-full glass-card rounded-2xl overflow-hidden shadow-xl" style={{ borderRadius: '16px' }}>
+          {CURR_CODES.filter(code => code !== excludeCode).map(code => {
+            const opt = CURR_MAP[code];
+            const isSel = code === value;
+            return (
+              <button
+                key={code}
+                type="button"
+                onClick={() => { onChange(code); setOpen(false); }}
+                className="w-full flex items-center gap-3 px-4 py-3 text-left transition-colors"
+                style={{ background: isSel ? 'var(--accent-soft)' : 'transparent' }}
+              >
+                <span className="text-lg">{opt.flag}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{opt.symbol} {code}</p>
+                  <p className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>{opt.name}</p>
+                </div>
+                {isSel && <Check size={14} strokeWidth={3} style={{ color: 'var(--accent)' }} />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const CurrencyPairCard = ({ CURR_MAP, CURR_CODES, selectedCurrencies, setPrimarySecondary, showToast, t, userProfile, requestConfirmation, onInventoryRecalculated }) => {
+  const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+  const fallbackSecondary = (p) => CURR_CODES.find(code => code !== p) || p;
+  const [primary, setPrimary] = useState(selectedCurrencies[0] || 'DOP');
+  const [secondary, setSecondary] = useState(selectedCurrencies[1] || fallbackSecondary(selectedCurrencies[0] || 'DOP'));
+  const [manualRate, setManualRate] = useState('');
+  const [savedManualRate, setSavedManualRate] = useState('');
+  const [loadingRate, setLoadingRate] = useState(true);
+  const [savingRate, setSavingRate] = useState(false);
+  const [autoInitialPct, setAutoInitialPct] = useState(DEFAULT_AUTO_INITIAL_PCT);
+  const [savedAutoInitialPct, setSavedAutoInitialPct] = useState(DEFAULT_AUTO_INITIAL_PCT);
+  const [savingPct, setSavingPct] = useState(false);
+  const [autoDaily, setAutoDaily] = useState(false);
+  const [savingAutoDaily, setSavingAutoDaily] = useState(false);
+  const [liveQuote, setLiveQuote] = useState(null);
+
+  useEffect(() => {
+    setPrimary(selectedCurrencies[0] || 'DOP');
+    setSecondary(selectedCurrencies[1] || fallbackSecondary(selectedCurrencies[0] || 'DOP'));
+  }, [selectedCurrencies]);
+
+  useEffect(() => {
+    if (!dealerId) { setLoadingRate(false); return; }
+    (async () => {
+      const config = await fetchDealerRateConfig(supabase, dealerId);
+      const rate = config?.manualRate ? String(config.manualRate) : '';
+      setManualRate(rate);
+      setSavedManualRate(rate);
+      setAutoDaily(config?.autoDaily === true);
+      const pct = config?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT;
+      setAutoInitialPct(pct);
+      setSavedAutoInitialPct(pct);
+      setLoadingRate(false);
+      // Trae la cotización del día para mostrarla junto al interruptor.
+      await resolveExchangeRate({ primary: config?.primary || DEFAULT_PRIMARY_CURRENCY, secondary: config?.secondary || DEFAULT_SECONDARY_CURRENCY, manualRate: null });
+      setLiveQuote(getLastRateMeta());
+    })();
+  }, [dealerId]);
+
+  const isDirty = primary !== (selectedCurrencies[0] || '') || secondary !== (selectedCurrencies[1] || '');
+  const isRateDirty = manualRate.trim() !== savedManualRate.trim();
+
+  const handlePrimaryChange = (code) => {
+    setPrimary(code);
+    if (code === secondary) setSecondary(fallbackSecondary(code));
+  };
+
+  const handleSave = () => {
+    const doSave = async () => {
+      setPrimarySecondary(primary, secondary);
+      if (dealerId) {
+        // .select() para poder distinguir "RLS bloqueó el UPDATE" (0 filas, sin error)
+        // de un guardado real — sin esto, un bloqueo de permisos pasa desapercibido.
+        const { data, error } = await supabase.from('dealers').update({ moneda_principal: primary, moneda_secundaria: secondary }).eq('id', dealerId).select();
+        if (error || !data?.length) {
+          console.warn('No se pudo sincronizar moneda_principal/secundaria en Supabase:', error?.message || 'RLS bloqueó el update (0 filas).');
+          showToast('No se pudo guardar en el servidor (permisos). Contacta soporte.');
+          return;
+        }
+      }
+      showToast('Monedas actualizadas.');
+    };
+    if (requestConfirmation) {
+      requestConfirmation({ title: '¿Cambiar Moneda?', message: '¿Seguro que quieres cambiar la moneda principal/secundaria?', confirmText: 'Cambiar', onConfirm: doSave });
+    } else if (window.confirm('¿Seguro que quieres cambiar la moneda?')) {
+      doSave();
+    }
+  };
+
+  const handleSaveRate = async () => {
+    if (!dealerId) return;
+    const trimmed = manualRate.trim();
+    if (trimmed && (isNaN(Number(trimmed)) || Number(trimmed) <= 0)) {
+      showToast('La tasa debe ser un número mayor a 0.');
+      return;
+    }
+    setSavingRate(true);
+    const { data, error } = await supabase.from('dealers').update({ tasa_cambio_manual: trimmed ? Number(trimmed) : null }).eq('id', dealerId).select();
+    if (error || !data?.length) {
+      setSavingRate(false);
+      showToast('No se pudo guardar la tasa de cambio.');
+      return;
+    }
+    setSavedManualRate(trimmed);
+    // La tasa cambia el valor convertido, así que los iniciales automáticos se
+    // recalculan igual que al mover el %.
+    const okCount = await recalcAutoIniciales(Number(savedAutoInitialPct));
+    setSavingRate(false);
+    if (okCount) onInventoryRecalculated?.();
+    showToast(trimmed ? `Tasa guardada — ${okCount || 0} inicial${okCount === 1 ? '' : 'es'} actualizado${okCount === 1 ? '' : 's'}.` : 'Tasa manual eliminada — se usará la tasa en vivo.');
+  };
+
+  // Interruptor tasa automática diaria / tasa fija. Al apagarlo se congela la
+  // cotización del día en el campo manual, para que "no cambie hasta que el
+  // dealer la cambie" sea literal y quede un número editable a la vista.
+  const handleToggleAutoDaily = async (next) => {
+    if (!dealerId || savingAutoDaily) return;
+    setSavingAutoDaily(true);
+    try {
+      const patch = { tasa_auto_diaria: next };
+      let frozen = manualRate.trim();
+      if (!next && !(Number(frozen) > 0)) {
+        const { rate } = await resolveExchangeRate({ primary, secondary, manualRate: null });
+        if (rate > 0) {
+          frozen = rate.toFixed(2);
+          patch.tasa_cambio_manual = Number(frozen);
+        }
+      }
+      const { data, error } = await supabase.from('dealers').update(patch).eq('id', dealerId).select();
+      if (error || !data?.length) {
+        showToast('No se pudo cambiar el modo de tasa.');
+        return;
+      }
+      setAutoDaily(next);
+      if (patch.tasa_cambio_manual != null) {
+        setManualRate(frozen);
+        setSavedManualRate(frozen);
+      }
+      const okCount = await recalcAutoIniciales(Number(savedAutoInitialPct));
+      if (okCount) onInventoryRecalculated?.();
+      showToast(next
+        ? `Tasa automática activada — ${okCount || 0} inicial${okCount === 1 ? '' : 'es'} actualizado${okCount === 1 ? '' : 's'}.`
+        : 'Tasa fija activada — no cambiará hasta que la edites.');
+    } finally {
+      setSavingAutoDaily(false);
+    }
+  };
+
+  // Recalcula el inicial de los vehículos con inicial autogenerado usando el %
+  // recibido. Devuelve la cantidad actualizada, o null si algo falló.
+  const recalcAutoIniciales = async (pctNum) => {
+    try {
+      const config = await fetchDealerRateConfig(supabase, dealerId);
+      const primaryCur = config?.primary || DEFAULT_PRIMARY_CURRENCY;
+      const secondaryCur = config?.secondary || DEFAULT_SECONDARY_CURRENCY;
+      const pct = pctNum / 100;
+      const { ratesToPrimary } = await resolveExchangeRate({ primary: primaryCur, secondary: secondaryCur, manualRate: config?.manualRate });
+
+      // Elegibles: los ya marcados como automáticos, más los heredados sin marca
+      // que están vacíos (nunca tuvieron un inicial escrito por el dealer). Un
+      // inicial con valor y sin marca se considera manual y no se toca.
+      const { data: rows, error: fetchErr } = await supabase
+        .from('vehiculos')
+        .select('id, precio, moneda_precio, inicial, inicial_automatico')
+        .eq('dealer_id', dealerId)
+        .is('deleted_at', null)
+        .gt('precio', 0)
+        .or('inicial_automatico.is.true,and(inicial_automatico.is.null,inicial.is.null),and(inicial_automatico.is.null,inicial.eq.0)');
+      if (fetchErr) throw fetchErr;
+      if (!rows?.length) return 0;
+
+      let okCount = 0;
+      const CHUNK = 8;
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        const results = await Promise.all(rows.slice(i, i + CHUNK).map(async (v) => {
+          const priceInPrimary = convertAmount(Number(v.precio), v.moneda_precio || secondaryCur, primaryCur, ratesToPrimary);
+          const newInicial = Math.round(priceInPrimary * pct);
+          const { error: updErr } = await supabase
+            .from('vehiculos')
+            .update({ inicial: newInicial, moneda_inicial: primaryCur, inicial_automatico: true })
+            .eq('id', v.id);
+          return !updErr;
+        }));
+        okCount += results.filter(Boolean).length;
+      }
+      return okCount;
+    } catch (err) {
+      console.error('Error recalculando inventario:', err);
+      return null;
+    }
+  };
+
+  // El % se guarda y propaga solo: sin botón de guardar ni de recalcular. Se
+  // espera a que el usuario suelte la barra (debounce) para no escribir en cada
+  // pixel del arrastre, y una secuencia descarta respuestas de un % ya viejo.
+  const pctSyncSeqRef = useRef(0);
+  const [pctSyncMsg, setPctSyncMsg] = useState('');
+
+  useEffect(() => {
+    if (!dealerId || loadingRate) return;
+    const pctNum = Number(autoInitialPct);
+    if (isNaN(pctNum) || pctNum < 0 || pctNum > 100) return;
+    if (pctNum === Number(savedAutoInitialPct)) return;
+
+    const seq = ++pctSyncSeqRef.current;
+    const timer = setTimeout(async () => {
+      setSavingPct(true);
+      setPctSyncMsg('Guardando…');
+      const { data, error } = await supabase.from('dealers').update({ porcentaje_inicial_auto: pctNum }).eq('id', dealerId).select();
+      if (seq !== pctSyncSeqRef.current) return;
+      if (error || !data?.length) {
+        setSavingPct(false);
+        setPctSyncMsg('');
+        showToast('No se pudo guardar el porcentaje.');
+        return;
+      }
+      setSavedAutoInitialPct(pctNum);
+
+      setPctSyncMsg('Actualizando inventario…');
+      const okCount = await recalcAutoIniciales(pctNum);
+      if (seq !== pctSyncSeqRef.current) return;
+      // Refresca el inventario en memoria: sin esto los números nuevos quedan
+      // solo en la base y la pantalla sigue mostrando los viejos hasta recargar.
+      if (okCount) onInventoryRecalculated?.();
+      setSavingPct(false);
+      if (okCount === null) {
+        setPctSyncMsg('Guardado, pero no se pudo actualizar el inventario.');
+      } else if (okCount === 0) {
+        setPctSyncMsg(`Guardado en ${pctNum}% — no hay vehículos con inicial automático.`);
+      } else {
+        setPctSyncMsg(`Guardado en ${pctNum}% — ${okCount} vehículo${okCount === 1 ? '' : 's'} actualizado${okCount === 1 ? '' : 's'}.`);
+      }
+    }, 700);
+
+    return () => clearTimeout(timer);
+  }, [autoInitialPct, savedAutoInitialPct, dealerId, loadingRate]);
+
+  return (
+    <div>
+      <h3 className="text-[10px] font-bold tracking-[0.2em] mb-2 uppercase px-1" style={{ color: 'var(--text-tertiary)' }}>{t('currencies_label')}</h3>
+      <p className="text-[10px] font-medium mb-4 px-1" style={{ color: 'var(--text-tertiary)' }}>Moneda principal y secundaria para mostrar precios en la app</p>
+      <div className="flex gap-3">
+        <CurrencyDropdownField label="Moneda Principal" value={primary} onChange={handlePrimaryChange} excludeCode={secondary} CURR_MAP={CURR_MAP} CURR_CODES={CURR_CODES} />
+        <CurrencyDropdownField label="Moneda Secundaria" value={secondary} onChange={setSecondary} excludeCode={primary} CURR_MAP={CURR_MAP} CURR_CODES={CURR_CODES} />
+      </div>
+      <button
+        onClick={handleSave}
+        disabled={!isDirty}
+        className="mt-3 w-full py-3 rounded-2xl text-xs font-black uppercase tracking-wide transition-all active:scale-[0.98] disabled:opacity-40"
+        style={{ background: 'var(--accent)', color: '#fff', boxShadow: isDirty ? 'var(--accent-glow)' : 'none' }}
+      >
+        Guardar
+      </button>
+
+      {dealerId && (
+        <div className="mt-5 pt-5" style={{ borderTop: '1px solid var(--divider)' }}>
+          <p className="text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>Tasa de Cambio</p>
+          <p className="text-[10px] font-medium mb-3" style={{ color: 'var(--text-tertiary)' }}>
+            1 {secondary} = ___ {primary}. Se usa en el catálogo público, la calculadora de financiamiento y el cálculo del inicial automático.
+          </p>
+          {loadingRate ? (
+            <p className="text-xs font-medium" style={{ color: 'var(--text-tertiary)' }}>Cargando…</p>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => handleToggleAutoDaily(!autoDaily)}
+                disabled={savingAutoDaily}
+                aria-pressed={autoDaily}
+                className="w-full flex items-center gap-3 p-3 rounded-2xl text-left transition-all active:scale-[0.99] disabled:opacity-60"
+                style={{ background: 'var(--input-bg)', border: `1px solid ${autoDaily ? 'var(--accent)' : 'var(--input-border)'}` }}
+              >
+                <span
+                  className="w-10 h-6 rounded-full shrink-0 relative transition-colors"
+                  style={{ background: autoDaily ? 'var(--accent)' : 'var(--divider)' }}
+                >
+                  <span
+                    className="absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all"
+                    style={{ left: autoDaily ? '1.125rem' : '0.125rem' }}
+                  />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-black" style={{ color: 'var(--text-primary)' }}>
+                    Actualizar la tasa automáticamente cada día
+                  </span>
+                  <span className="block text-[10px] font-medium mt-0.5" style={{ color: 'var(--text-tertiary)' }}>
+                    {autoDaily
+                      ? 'Usa la tasa del día y recalcula tus iniciales automáticos solo.'
+                      : 'Tasa fija: no cambia hasta que tú la edites aquí abajo.'}
+                  </span>
+                </span>
+              </button>
+
+              {liveQuote?.venta > 0 && (
+                <p className="text-[10px] font-medium mt-2" style={{ color: 'var(--text-tertiary)' }}>
+                  Tasa de venta: <strong style={{ color: 'var(--text-primary)' }}>1 US$ = RD$ {Number(liveQuote.venta).toFixed(2)}</strong>
+                  {liveQuote.source === 'bcrd'
+                    ? ` · Banco Central${liveQuote.date ? `, ${liveQuote.date}` : ''}`
+                    : ' · tasa de referencia internacional'}
+                </p>
+              )}
+
+              {!autoDaily && (
+                <div className="flex gap-2 mt-3">
+                  <div className="flex-1 flex items-center gap-2 px-4 py-3 rounded-2xl" style={{ background: 'var(--input-bg)', border: '1px solid var(--input-border)' }}>
+                    <span className="text-xs font-bold shrink-0" style={{ color: 'var(--text-tertiary)' }}>1 {secondary} =</span>
+                    <input
+                      type="number" step="0.01" min="0" placeholder="Ej. 60.00"
+                      value={manualRate}
+                      onChange={(e) => setManualRate(e.target.value)}
+                      className="flex-1 min-w-0 bg-transparent text-sm font-bold outline-none"
+                      style={{ color: 'var(--text-primary)' }}
+                    />
+                    <span className="text-xs font-bold shrink-0" style={{ color: 'var(--text-tertiary)' }}>{primary}</span>
+                  </div>
+                  <button
+                    onClick={handleSaveRate}
+                    disabled={savingRate || !isRateDirty}
+                    className="px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wide transition-all active:scale-95 disabled:opacity-40 shrink-0"
+                    style={{ background: 'var(--input-bg)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)' }}
+                  >
+                    {savingRate ? '...' : 'Guardar'}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {dealerId && !loadingRate && (
+        <div className="mt-5 pt-5" style={{ borderTop: '1px solid var(--divider)' }}>
+          <p className="text-[9px] font-bold uppercase tracking-wide mb-1" style={{ color: 'var(--text-tertiary)' }}>% Inicial Automático</p>
+          <p className="text-[10px] font-medium mb-3" style={{ color: 'var(--text-tertiary)' }}>
+            Cuando el cliente no da un inicial, se autorellena con este % del precio (convertido a {primary}).
+          </p>
+          <div className="flex items-center gap-3">
+            <input
+              type="range" min="0" max="100" step="1"
+              value={autoInitialPct}
+              onChange={(e) => setAutoInitialPct(Number(e.target.value))}
+              className="flex-1 accent-red-600"
+              style={{ accentColor: 'var(--accent)' }}
+            />
+            <div className="flex items-center gap-1 px-3 py-2 rounded-xl shrink-0" style={{ background: 'var(--input-bg)', border: '1px solid var(--input-border)' }}>
+              <input
+                type="number" min="0" max="100" step="1"
+                value={autoInitialPct}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  setAutoInitialPct(isNaN(n) ? 0 : Math.min(100, Math.max(0, n)));
+                }}
+                className="w-10 bg-transparent text-sm font-black text-right outline-none"
+                style={{ color: 'var(--text-primary)' }}
+              />
+              <span className="text-sm font-black" style={{ color: 'var(--text-tertiary)' }}>%</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 mt-2 min-h-[14px]">
+            {savingPct && (
+              <span className="w-2.5 h-2.5 rounded-full border-2 border-t-transparent animate-spin shrink-0" style={{ borderColor: 'var(--accent)', borderTopColor: 'transparent' }} />
+            )}
+            <p className="text-[9px] font-bold" style={{ color: savingPct ? 'var(--accent)' : 'var(--text-tertiary)' }}>
+              {pctSyncMsg || 'Se guarda y aplica automáticamente a tu inventario.'}
+            </p>
+          </div>
+          <p className="text-[9px] font-medium mt-1" style={{ color: 'var(--text-tertiary)' }}>
+            Solo actualiza vehículos cuyo inicial fue autogenerado — nunca sobreescribe uno que hayas escrito tú mismo.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDisconnectGhl, onShowDealerSwitcher, isSuperAdmin, isPlatformAdminUser, requestConfirmation, onInventoryRecalculated }) => {
   const { t, locale, changeLocale, SUPPORTED_LOCALES, LOCALE_LABELS } = useI18n();
   const { theme, isDark, toggleTheme } = useTheme();
-  const { selected: selectedCurrencies, toggleCurrency, CURRENCIES: CURR_MAP, CURRENCY_CODES: CURR_CODES } = useCurrency();
+  const { selected: selectedCurrencies, setPrimarySecondary, CURRENCIES: CURR_MAP, CURRENCY_CODES: CURR_CODES } = useCurrency();
   const [isEditing, setIsEditing] = useState(false);
   const [formData, setFormData] = useState({
     name: userProfile?.name || '',
     jobTitle: userProfile?.jobTitle || 'Vendedor',
-    newPassword: ''
   });
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isUploadingLogo, setIsUploadingLogo] = useState(false);
   const fileInputRef = useRef(null);
   const logoInputRef = useRef(null);
+  const [openToolIdx, setOpenToolIdx] = useState(null);
 
   useEffect(() => {
     if (userProfile) {
       setFormData({
         name: (userProfile.email?.toLowerCase() === 'jeancarlosgf13@gmail.com') ? 'Jean Gomez' : (userProfile.name || ''),
         jobTitle: userProfile.jobTitle || 'Vendedor',
-        newPassword: ''
       });
     }
   }, [userProfile]);
@@ -3731,44 +5210,53 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
     window.open(link, '_blank');
   };
 
+  const isDuranFernandezDealer = (() => {
+    const dn = (userProfile?.dealerName || '').toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    return dn.includes('DURAN') && dn.includes('FERNANDEZ');
+  })();
+
+  const dealerSlugForTools = (() => {
+    const dealerName = userProfile?.dealerName || 'default';
+    if (isDuranFernandezDealer) return 'duran-fernandez-auto-srl';
+    return dealerName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\./g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  })();
+
   const toolItems = [
     {
+      // Link liviano con datos b\u00e1sicos + etiquetas para respuestas r\u00e1pidas del bot
       title: t('bot_carbot'),
+      description: 'Copia el enlace del bot con datos b\u00e1sicos para respuestas r\u00e1pidas.',
       icon: Sparkles,
       iconColor: '#A855F7',
       iconBg: 'rgba(168, 85, 247, 0.12)',
+      actionLabel: 'Copiar enlace',
       action: () => {
-        const dealerName = userProfile?.dealerName || 'default';
-        let s = dealerName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\./g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-        const normalized = dealerName.toUpperCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-        if (normalized.includes('DURAN') && normalized.includes('FERNANDEZ')) s = 'duran-fernandez-auto-srl';
-        const linkJson = `https://carbotsystem.com/inventario/${s}/bot`;
-        navigator.clipboard.writeText(linkJson);
+        const link = `https://carbotsystem.com/inventario/${dealerSlugForTools}/carbot-simple`;
+        navigator.clipboard.writeText(link);
         showToast(t('toast_link_copied_bot'));
       }
     },
     {
-      title: t('platform_status'),
-      icon: Link,
-      isDisconnectable: true,
-      iconColor: !!userProfile?.ghlLocationId ? '#3B82F6' : 'var(--text-tertiary)',
-      iconBg: !!userProfile?.ghlLocationId ? 'rgba(59, 130, 246, 0.12)' : 'var(--input-bg)',
-      isConnected: !!userProfile?.ghlLocationId,
+      // Especificaciones completas + fotos
+      title: t('bot_specs'),
+      description: 'Copia el enlace con especificaciones completas y fotos del inventario.',
+      icon: Sparkles,
+      iconColor: '#A855F7',
+      iconBg: 'rgba(168, 85, 247, 0.12)',
+      actionLabel: 'Copiar enlace',
       action: () => {
-        if (!!userProfile?.ghlLocationId) {
-          if (onDisconnectGhl) onDisconnectGhl();
-        } else {
-          const dealerUuid = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
-          const stateParam = dealerUuid ? `&state=${encodeURIComponent(dealerUuid)}` : '';
-          window.open(`${GHL_INSTALL_URL}${stateParam}`, '_blank');
-        }
+        const linkJson = `https://carbotsystem.com/inventario/${dealerSlugForTools}/bot`;
+        navigator.clipboard.writeText(linkJson);
+        showToast(t('toast_link_copied_specs'));
       }
     },
     {
       title: t('public_catalog'),
+      description: 'Copia el enlace del cat\u00e1logo p\u00fablico de tu inventario.',
       icon: LayoutGrid,
       iconColor: '#F97316',
       iconBg: 'rgba(249, 115, 22, 0.12)',
+      actionLabel: 'Copiar enlace',
       action: () => {
         const link = userProfile?.catalogo_url || (() => {
           const dn = userProfile?.dealerName || 'default';
@@ -3780,13 +5268,14 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
       }
     },
     ...(() => {
-      const dn = (userProfile?.dealerName || '').toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-      if (dn.includes('DURAN') && dn.includes('FERNANDEZ')) {
+      if (isDuranFernandezDealer) {
         return [{
           title: 'Cat\u00e1logo Meta',
+          description: 'Copia el enlace del feed de cat\u00e1logo para Meta (Facebook/Instagram).',
           icon: FileSpreadsheet,
           iconColor: '#1877F2',
           iconBg: 'rgba(24, 119, 242, 0.12)',
+          actionLabel: 'Copiar enlace',
           action: () => {
             navigator.clipboard.writeText('https://us-central1-carbot-5d709.cloudfunctions.net/metaFeedDuran');
             showToast('Link de Cat\u00e1logo Meta copiado');
@@ -3795,6 +5284,39 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
       }
       return [];
     })(),
+    {
+      title: t('platform_status'),
+      description: !!userProfile?.ghlLocationId ? 'Tu cuenta de GoHighLevel est\u00e1 conectada.' : 'Conecta tu cuenta de GoHighLevel para sincronizar contactos.',
+      icon: Link,
+      isDisconnectable: true,
+      iconColor: !!userProfile?.ghlLocationId ? '#3B82F6' : 'var(--text-tertiary)',
+      iconBg: !!userProfile?.ghlLocationId ? 'rgba(59, 130, 246, 0.12)' : 'var(--input-bg)',
+      isConnected: !!userProfile?.ghlLocationId,
+      actionLabel: !!userProfile?.ghlLocationId ? 'Desconectar' : 'Conectar',
+      action: () => {
+        if (!!userProfile?.ghlLocationId) {
+          if (onDisconnectGhl) onDisconnectGhl();
+        } else {
+          const dealerUuid = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+          const stateParam = dealerUuid ? `&state=${encodeURIComponent(dealerUuid)}` : '';
+          window.open(`${GHL_INSTALL_URL}${stateParam}`, '_blank');
+        }
+      }
+    },
+    {
+      title: 'Financiamiento',
+      icon: CreditCard,
+      iconColor: '#10B981',
+      iconBg: 'rgba(16, 185, 129, 0.12)',
+      render: () => <FinancingBanksCard userProfile={userProfile} showToast={showToast} embedded />,
+    },
+    {
+      title: 'API de Inventario',
+      icon: Key,
+      iconColor: '#0EA5E9',
+      iconBg: 'rgba(14, 165, 233, 0.12)',
+      render: () => <DealerApiKeyCard userProfile={userProfile} showToast={showToast} />,
+    },
   ];
 
   return (
@@ -3906,7 +5428,7 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
           ) : (
             <>
               <button
-                onClick={() => { setIsEditing(false); setFormData({ name: userProfile?.name || '', jobTitle: userProfile?.jobTitle || 'Vendedor', newPassword: '' }); }}
+                onClick={() => { setIsEditing(false); setFormData({ name: userProfile?.name || '', jobTitle: userProfile?.jobTitle || 'Vendedor' }); }}
                 className="flex items-center gap-2 px-5 py-2.5 rounded-2xl text-sm font-bold transition-all active:scale-95"
                 style={{ background: 'var(--input-bg)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)' }}
               >
@@ -3922,13 +5444,13 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
               </button>
             </>
           )}
-          {isSuperAdmin && !isEditing && (
+          {(isSuperAdmin || isPlatformAdminUser) && !isEditing && (
             <button
               onClick={onShowDealerSwitcher}
-              className="flex items-center gap-2 px-5 py-2.5 text-white rounded-2xl text-sm font-bold transition-all active:scale-95"
-              style={{ background: 'var(--bg-tertiary)', boxShadow: 'var(--shadow-card)' }}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-2xl text-sm font-bold transition-all active:scale-95"
+              style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)', boxShadow: 'var(--shadow-card)' }}
             >
-              <LayoutGrid size={16} /> PANEL MASTER
+              <LayoutGrid size={16} /> {t('panel_master')}
             </button>
           )}
         </div>
@@ -4011,107 +5533,93 @@ const SettingsView = ({ userProfile, onLogout, onUpdateProfile, showToast, onDis
           </div>
         </div>
 
-        {/* Currencies: Select up to 2 */}
-        <div>
-          <h3 className="text-[10px] font-bold tracking-[0.2em] mb-2 uppercase px-1" style={{ color: 'var(--text-tertiary)' }}>{t('currencies_label')}</h3>
-          <p className="text-[10px] font-medium mb-4 px-1" style={{ color: 'var(--text-tertiary)' }}>{t('currencies_hint') || 'Selecciona hasta 2 monedas'}</p>
-          <div className="flex flex-col gap-2">
-            {CURR_CODES.map(code => {
-              const c = CURR_MAP[code];
-              const isActive = selectedCurrencies.includes(code);
-              return (
-                <button
-                  key={code}
-                  onClick={() => toggleCurrency(code)}
-                  className="glass-card flex items-center gap-4 px-5 py-4 rounded-2xl transition-all duration-300 active:scale-[0.98]"
-                  style={{
-                    borderRadius: '16px',
-                    border: isActive ? '2px solid var(--accent)' : '2px solid transparent',
-                    background: isActive ? 'var(--accent-soft)' : undefined,
-                  }}
-                >
-                  <span className="text-2xl">{c?.flag}</span>
-                  <div className="flex-1 text-left">
-                    <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{c?.symbol} — {t(`currency_${code}`)}</p>
-                    <p className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>{c?.name}</p>
-                  </div>
-                  <div
-                    className="w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition-all"
-                    style={isActive
-                      ? { background: 'var(--accent)', color: '#fff' }
-                      : { background: 'var(--input-bg)', border: '2px solid var(--input-border)' }
-                    }
-                  >
-                    {isActive && <Check size={14} strokeWidth={3} />}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        {/* Currencies: Primary + Secondary */}
+        <CurrencyPairCard
+          CURR_MAP={CURR_MAP}
+          CURR_CODES={CURR_CODES}
+          selectedCurrencies={selectedCurrencies}
+          setPrimarySecondary={setPrimarySecondary}
+          showToast={showToast}
+          t={t}
+          userProfile={userProfile}
+          requestConfirmation={requestConfirmation}
+          onInventoryRecalculated={onInventoryRecalculated}
+        />
 
         {/* Security: Password */}
         <div>
           <h3 className="text-[10px] font-bold tracking-[0.2em] mb-4 uppercase px-1" style={{ color: 'var(--text-tertiary)' }}>{t('account_security')}</h3>
-          {isEditing ? (
-            <div className="glass-card rounded-2xl p-5" style={{ borderRadius: '20px' }}>
-              <div className="flex items-center justify-between mb-3">
-                <p className="text-[10px] font-bold tracking-wider uppercase" style={{ color: 'var(--text-secondary)' }}>{t('changePassword')}</p>
-                <span className="text-[9px] font-bold uppercase tracking-widest px-3 py-1 rounded-full" style={{ background: 'var(--input-bg)', color: 'var(--text-tertiary)' }}>{t('optional')}</span>
-              </div>
-              <input
-                type="password"
-                placeholder="Nueva contraseña (Mínimo 6 chars)"
-                value={formData.newPassword || ''}
-                onChange={(e) => setFormData({ ...formData, newPassword: e.target.value })}
-                className="glass-input w-full px-4 py-3 text-sm font-bold"
-              />
-            </div>
-          ) : (
-            <div className="glass-card rounded-2xl p-5 flex items-center justify-between" style={{ borderRadius: '20px' }}>
-              <div className="flex items-center gap-4">
-                <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'rgba(16, 185, 129, 0.12)', color: '#10B981' }}>
-                  <ShieldCheck size={18} strokeWidth={2.5} />
-                </div>
-                <div>
-                  <p className="text-[9px] font-bold tracking-wider uppercase" style={{ color: 'var(--text-tertiary)' }}>{t('password_label')}</p>
-                  <p className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>••••••••</p>
-                </div>
-              </div>
-              <div className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: 'rgba(16, 185, 129, 0.12)', color: '#10B981' }}>
-                <Check size={14} strokeWidth={3} />
-              </div>
-            </div>
-          )}
+          <ChangePasswordCard userProfile={userProfile} showToast={showToast} t={t} />
+        </div>
+
+        {/* Contact: WhatsApp number/link used by the public vehicle page */}
+        <div>
+          <h3 className="text-[10px] font-bold tracking-[0.2em] mb-4 uppercase px-1" style={{ color: 'var(--text-tertiary)' }}>Contacto</h3>
+          <WhatsAppContactCard userProfile={userProfile} showToast={showToast} />
         </div>
 
         {/* Tools */}
         <div>
           <h3 className="text-[10px] font-bold tracking-[0.2em] mb-4 uppercase px-1" style={{ color: 'var(--text-tertiary)' }}>{t('tools')}</h3>
-          <div className="space-y-2">
-            {toolItems.map((tool, idx) => (
-              <div
-                key={idx}
-                onClick={tool.action}
-                className="glass-card rounded-2xl px-5 py-4 flex items-center justify-between cursor-pointer transition-all duration-300 hover:-translate-y-0.5 hover:scale-[1.005] group active:scale-[0.99]"
-                style={{ borderRadius: '20px' }}
-              >
-                <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 rounded-xl flex items-center justify-center transition-transform duration-300 group-hover:scale-110" style={{ background: tool.isDisconnectable && !tool.isConnected ? 'rgba(255,59,48,0.12)' : tool.iconBg, color: tool.isDisconnectable && !tool.isConnected ? 'var(--accent)' : tool.iconColor }}>
-                    <tool.icon size={18} strokeWidth={2.5} />
-                  </div>
-                  <div>
-                    <span className="block text-sm font-bold" style={{ color: 'var(--text-primary)' }}>{tool.title}</span>
-                    {tool.isConnected !== undefined && (
-                      <span className="text-[10px] font-bold uppercase tracking-[0.12em] mt-0.5 block" style={{ color: tool.isConnected ? '#10B981' : 'var(--accent)' }}>
-                        {tool.isConnected ? t('connected') : t('disconnected')}
-                      </span>
+          <div className="grid grid-cols-2 gap-3">
+            {toolItems.map((tool, idx) => {
+              const isExpandable = !!tool.render || tool.isDisconnectable;
+              const isOpen = isExpandable && openToolIdx === idx;
+              return (
+                <div key={idx} className={isOpen ? 'col-span-2' : 'col-span-1'}>
+                  <button
+                    type="button"
+                    onClick={() => isExpandable ? setOpenToolIdx(isOpen ? null : idx) : tool.action()}
+                    className="glass-card w-full rounded-2xl px-4 py-4 flex items-center gap-3 text-left transition-all duration-300 hover:-translate-y-0.5 group active:scale-[0.99]"
+                    style={{ borderRadius: '18px', border: `2px solid ${isOpen ? 'var(--accent)' : 'transparent'}` }}
+                  >
+                    <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-transform duration-300 group-hover:scale-110" style={{ background: tool.isDisconnectable && !tool.isConnected ? 'rgba(255,59,48,0.12)' : tool.iconBg, color: tool.isDisconnectable && !tool.isConnected ? 'var(--accent)' : tool.iconColor }}>
+                      <tool.icon size={18} strokeWidth={2.5} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <span className="block text-xs sm:text-sm font-bold truncate" style={{ color: 'var(--text-primary)' }}>{tool.title}</span>
+                      {tool.isConnected !== undefined && (
+                        <span className="text-[9px] font-bold uppercase tracking-[0.12em] mt-0.5 block" style={{ color: tool.isConnected ? '#10B981' : 'var(--accent)' }}>
+                          {tool.isConnected ? t('connected') : t('disconnected')}
+                        </span>
+                      )}
+                    </div>
+                    {isExpandable ? (
+                      <ChevronDown size={16} className="shrink-0 transition-transform duration-300" style={{ color: 'var(--text-tertiary)', transform: isOpen ? 'rotate(180deg)' : 'none' }} />
+                    ) : (
+                      <Copy size={16} className="shrink-0" style={{ color: 'var(--text-tertiary)' }} />
                     )}
-                  </div>
+                  </button>
+                  <AnimatePresence>
+                    {isOpen && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: 'auto' }}
+                        exit={{ opacity: 0, height: 0 }}
+                        transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+                        className="overflow-hidden"
+                      >
+                        <div className="glass-card rounded-2xl px-5 py-4 mt-2" style={{ borderRadius: '18px' }}>
+                          {tool.render ? tool.render() : (
+                          <>
+                          <p className="text-[11px] font-medium mb-3" style={{ color: 'var(--text-tertiary)' }}>{tool.description}</p>
+                          <button
+                            type="button"
+                            onClick={() => { tool.action(); if (!tool.isDisconnectable) setOpenToolIdx(null); }}
+                            className="px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wide transition-all active:scale-95"
+                            style={tool.isDisconnectable && tool.isConnected ? { background: 'rgba(255,59,48,0.12)', color: 'var(--accent)' } : { background: 'var(--accent)', color: '#fff', boxShadow: 'var(--accent-glow)' }}
+                          >
+                            {tool.actionLabel}
+                          </button>
+                          </>
+                          )}
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </div>
-                <ChevronRight size={16} className="transition-transform duration-300 group-hover:translate-x-1" style={{ color: 'var(--text-tertiary)' }} />
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -4632,14 +6140,26 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
     e.stopPropagation();
     setOpenMenuId(null);
 
-    // Preparar el duplicado sin fotos
-    const { id, images, image, createdAt, updatedAt, ...rest } = vehicle;
+    // Preparar el duplicado sin fotos ni datos propios de la unidad física
+    // (VIN/chasis, placa, millaje): esos deben quedar vacíos hasta que el
+    // usuario los complete manualmente para la nueva unidad.
+    const {
+      id, images, image, createdAt, updatedAt,
+      vin, chassis, chasis_vin,
+      plate, placa,
+      mileage, millas,
+      ...rest
+    } = vehicle;
 
-    // Añadimos un sufijo único para evitar colisiones de ID
-    const uniqueSuffix = '-' + Date.now().toString().slice(-4);
     const duplicatedData = {
       ...rest,
-      vin: (rest.vin || '').trim() + uniqueSuffix,
+      vin: '',
+      chassis: '',
+      chasis_vin: null,
+      plate: '',
+      placa: '',
+      mileage: 0,
+      millas: 0,
       images: [],
       image: '',
       status: 'available',
@@ -4648,7 +6168,7 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
 
     requestConfirmation({
       title: 'Duplicar Vehículo',
-      message: `¿Deseas duplicar los datos de ${vehicle.make} ${vehicle.model}? Se creará una copia sin fotos.`,
+      message: `¿Deseas duplicar los datos de ${vehicle.make} ${vehicle.model}? Se creará una copia sin fotos, VIN/chasis, placa ni millaje.`,
       confirmText: 'Duplicar Ahora',
       onConfirm: async () => {
         try {
@@ -4656,6 +6176,30 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
           showToast(`¡Copia de ${vehicle.model} creada con éxito!`);
         } catch (err) {
           showToast("Error al duplicar el vehículo", "error");
+        }
+      }
+    });
+  };
+
+  // Marca el vehículo como vendido directamente (sin generar contrato ni pedir
+  // datos del cliente) — solo cambia el estado en Supabase para casos donde
+  // el dealer ya vendió por fuera del flujo de documentos.
+  const handleMarkSoldDirect = (e, vehicle) => {
+    e.stopPropagation();
+    setOpenMenuId(null);
+    requestConfirmation({
+      title: 'Marcar como Vendido',
+      message: `¿Deseas marcar ${vehicle.make} ${vehicle.model} como vendido? No se generará ningún documento ni se pedirán datos del cliente.`,
+      confirmText: 'Marcar como Vendido',
+      onConfirm: async () => {
+        try {
+          const { error } = await supabase.from('vehiculos').update({ estado: 'Vendido' }).eq('id', vehicle.id);
+          if (error) throw error;
+          setInventory(prev => prev.map(v => v.id === vehicle.id ? { ...v, estado: 'Vendido', status: 'sold' } : v));
+          showToast(`${vehicle.make} ${vehicle.model} marcado como vendido.`);
+        } catch (err) {
+          console.error('Error al marcar como vendido:', err);
+          showToast('No se pudo marcar como vendido.', 'error');
         }
       }
     });
@@ -4702,11 +6246,11 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
           return priceA - priceB;
         }
         case 'updated_desc': return new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0);
-        case 'name_asc': return `${a.make || ''} ${a.model || ''}`.localeCompare(`${b.make || ''} ${b.model || ''}`);
+        case 'name_asc': return `${a.make || ''} ${a.model || ''}`.toUpperCase().localeCompare(`${b.make || ''} ${b.model || ''}`.toUpperCase());
         case 'brand_asc':
-          const brandCompare = (a.make || '').localeCompare(b.make || '');
+          const brandCompare = (a.make || '').toUpperCase().localeCompare((b.make || '').toUpperCase());
           if (brandCompare !== 0) return brandCompare;
-          return (a.model || '').localeCompare(b.model || '');
+          return (a.model || '').toUpperCase().localeCompare((b.model || '').toUpperCase());
         default: return 0;
       }
     });
@@ -4719,7 +6263,7 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
     const isBrandSort = sortConfig === 'brand_asc';
 
     filteredInventory.forEach(item => {
-      const groupKey = isBrandSort ? item.make : "RESULTADOS";
+      const groupKey = isBrandSort ? (item.make || '').toUpperCase() : "RESULTADOS";
       if (!groups[groupKey]) groups[groupKey] = [];
       groups[groupKey].push(item);
     });
@@ -5108,7 +6652,36 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
                                 </button>
 
                                 {openMenuId === item.id && (
-                                  <div className="absolute bottom-full right-0 mb-2 w-48 bg-white rounded-[2rem] shadow-2xl border border-slate-100 py-3 z-[60] animate-in slide-in-from-bottom-2">
+                                  <div className="absolute bottom-full right-0 mb-2 w-60 bg-white rounded-[2rem] shadow-2xl border border-slate-100 py-3 z-[60] animate-in slide-in-from-bottom-2">
+                                    {(formatVehicleTimestamp(item.createdAt) || formatVehicleTimestamp(item.updatedAt)) && (
+                                      <div className="px-5 pb-3 mb-2 border-b border-slate-100">
+                                        <div className="bg-slate-50 rounded-2xl px-4 py-3 space-y-2.5">
+                                          {formatVehicleTimestamp(item.createdAt) && (
+                                            <div className="flex items-center gap-2.5">
+                                              <Calendar size={12} className="text-slate-400 shrink-0" />
+                                              <div className="flex flex-col leading-tight min-w-0">
+                                                <span className="text-[8px] font-black uppercase tracking-widest text-slate-400">Agregado</span>
+                                                <span className="text-[10.5px] font-bold text-slate-700 truncate">{formatVehicleTimestamp(item.createdAt)}</span>
+                                              </div>
+                                            </div>
+                                          )}
+                                          {formatVehicleTimestamp(item.updatedAt) && (
+                                            <div className="flex items-center gap-2.5">
+                                              <RefreshCw size={12} className="text-slate-400 shrink-0" />
+                                              <div className="flex flex-col leading-tight min-w-0">
+                                                <span className="text-[8px] font-black uppercase tracking-widest text-slate-400">Actualizado</span>
+                                                <span className="text-[10.5px] font-bold text-slate-700 truncate">{formatVehicleTimestamp(item.updatedAt)}</span>
+                                              </div>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    )}
+                                    {!isSold && (
+                                      <button onClick={(e) => handleMarkSoldDirect(e, item)} className="w-full px-6 py-3 text-left text-[10px] font-black uppercase tracking-widest text-emerald-600 hover:bg-emerald-50 transition-colors flex items-center gap-3">
+                                        <FileSignature size={14} /> Marcar como Vendido
+                                      </button>
+                                    )}
                                     <button onClick={(e) => handleDuplicate(e, item)} className="w-full px-6 py-3 text-left text-[10px] font-black uppercase tracking-widest text-slate-600 hover:bg-red-50 hover:text-red-700 transition-colors flex items-center gap-3">
                                       <Copy size={14} /> Duplicar
                                     </button>
@@ -5896,8 +7469,339 @@ const normalizeStringForId = (str) => {
 
 const GHL_INSTALL_URL = `https://marketplace.leadconnectorhq.com/oauth/chooselocation?response_type=code&redirect_uri=https%3A%2F%2Flpiwkennlavpzisdvnnh.supabase.co%2Ffunctions%2Fv1%2Foauth-callback&client_id=699b6f13fb99957c718a1e38-mma1agkx&scope=contacts.readonly+contacts.write+documents_contracts%2Flist.readonly+documents_contracts%2FsendLink.write+documents_contracts_template%2Flist.readonly+locations.readonly+users.readonly+documents_contracts_template%2FsendLink.write+locations%2FcustomFields.readonly+locations%2FcustomFields.write+custom-menu-link.readonly+custom-menu-link.write+conversations.readonly+conversations.write+conversations%2Fmessage.readonly+conversations%2Fmessage.write+conversations%2Freports.readonly+conversations%2Flivechat.write+conversation-ai.readonly+conversation-ai.write&version_id=69ab5865c2202af8a273fd40`;
 
-const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect, isSuperAdmin, onSoftDelete, onRecover, onCreateDealer }) => {
+const PANEL_MASTER_PERMISSIONS = [
+  { key: 'install_dealer', label: 'Instalar dealers' },
+  { key: 'delete_dealer', label: 'Eliminar dealers' },
+  { key: 'edit_dealer', label: 'Editar dealers' },
+  { key: 'enter_any_account', label: 'Entrar a cualquier cuenta' },
+  { key: 'manage_admins', label: 'Gestionar administradores' },
+  { key: 'view_all_dealers', label: 'Ver todos los dealers' },
+];
+
+const PanelMasterPermissionChecklist = ({ value, onChange, disabled }) => (
+  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+    {PANEL_MASTER_PERMISSIONS.map(p => (
+      <label key={p.key} className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer" style={{ background: 'var(--input-bg)', border: '1px solid var(--border-glass)' }}>
+        <div
+          className="rounded-md flex items-center justify-center shrink-0 transition-all"
+          style={{ width: 18, height: 18, background: value[p.key] ? 'var(--accent)' : 'var(--bg-elevated)', border: value[p.key] ? '1px solid var(--accent)' : '1px solid var(--border-glass)' }}
+          onClick={() => !disabled && onChange({ ...value, [p.key]: !value[p.key] })}
+        >
+          {value[p.key] && <Check size={12} className="text-white stroke-[4]" />}
+        </div>
+        <span className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{p.label}</span>
+      </label>
+    ))}
+  </div>
+);
+
+const PanelMasterTeamTab = ({ platformAdmins, ownUserId, canManageAdmins, onSearchUsers, onAddAdmin, onUpdateAdmin, onRemoveAdmin, showToast }) => {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [selectedCandidate, setSelectedCandidate] = useState(null);
+  const [permissions, setPermissions] = useState({});
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [editingAdmin, setEditingAdmin] = useState(null); // existing admin being edited
+  const [manualMode, setManualMode] = useState(false);
+  const [manualEmail, setManualEmail] = useState('');
+  const [manualName, setManualName] = useState('');
+
+  const [searchError, setSearchError] = useState('');
+
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) { setResults([]); setSearchError(''); return; }
+    const handle = setTimeout(async () => {
+      setSearching(true);
+      setSearchError('');
+      try {
+        const r = await onSearchUsers(q);
+        setResults(r);
+      } catch (err) {
+        setSearchError(err.message || 'Error al buscar usuarios.');
+        setResults([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+    return () => clearTimeout(handle);
+  }, [query, onSearchUsers]);
+
+  const resetForm = () => {
+    setSelectedCandidate(null);
+    setEditingAdmin(null);
+    setPermissions({});
+    setPassword('');
+    setQuery('');
+    setResults([]);
+    setManualMode(false);
+    setManualEmail('');
+    setManualName('');
+  };
+
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(manualEmail.trim());
+
+  const handleContinueManual = () => {
+    if (!emailValid) {
+      showToast?.('Correo inválido.', 'error');
+      return;
+    }
+    setSelectedCandidate({ id: null, correo: manualEmail.trim().toLowerCase(), nombre: manualName.trim(), isManual: true });
+    setPermissions({});
+    setPassword('');
+  };
+
+  const handleSubmit = async () => {
+    if (password && password.length < 8) {
+      showToast?.('La contraseña debe tener al menos 8 caracteres.', 'error');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      if (editingAdmin) {
+        await onUpdateAdmin({ user_id: editingAdmin.user_id, permissions, password: password || undefined });
+      } else if (selectedCandidate?.isManual) {
+        await onAddAdmin({ correo: selectedCandidate.correo, nombre: selectedCandidate.nombre, permissions, password: password || undefined });
+      } else if (selectedCandidate) {
+        await onAddAdmin({ usuario_id: selectedCandidate.id, permissions, password: password || undefined });
+      }
+      resetForm();
+    } catch (err) {
+      showToast?.(err.message || 'Error al guardar administrador.', 'error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (!canManageAdmins) {
+    return (
+      <div className="px-6 py-10 text-center">
+        <ShieldCheck size={28} className="mx-auto mb-3" style={{ color: 'var(--text-tertiary)' }} />
+        <p className="text-sm font-bold" style={{ color: 'var(--text-secondary)' }}>No tienes permiso para gestionar administradores.</p>
+      </div>
+    );
+  }
+
+  const isFormOpen = !!selectedCandidate || !!editingAdmin;
+
+  return (
+    <div className="px-6 sm:px-10 pb-6 flex-1 overflow-y-auto" style={{ scrollbarWidth: 'none' }}>
+      {!isFormOpen && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Team roster */}
+          <div>
+            <p className="text-[11px] font-black uppercase tracking-wider mb-2" style={{ color: 'var(--text-tertiary)' }}>Administradores</p>
+            <div className="flex flex-col gap-1.5">
+              {platformAdmins.map(admin => (
+                <div key={admin.user_id} className="flex items-center gap-3 px-3 py-3 rounded-2xl" style={{ background: 'var(--input-bg)' }}>
+                  <div className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0 font-black text-xs" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
+                    {(admin.nombre || admin.correo || '?').charAt(0).toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-black truncate" style={{ color: 'var(--text-primary)' }}>{admin.nombre || admin.correo}</div>
+                    <div className="text-[10px] font-bold truncate" style={{ color: 'var(--text-tertiary)' }}>
+                      {admin.is_super_admin ? 'Super Admin' : Object.entries(admin.permissions || {}).filter(([, v]) => v).map(([k]) => PANEL_MASTER_PERMISSIONS.find(p => p.key === k)?.label).filter(Boolean).join(' · ') || 'Sin permisos'}
+                    </div>
+                  </div>
+                  {!admin.is_super_admin && (
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={() => { setEditingAdmin(admin); setPermissions(admin.permissions || {}); setPassword(''); }}
+                        className="p-1.5 rounded-lg transition-all"
+                        style={{ color: 'var(--text-tertiary)' }}
+                        title="Editar permisos"
+                      >
+                        <Edit size={14} />
+                      </button>
+                      {admin.user_id !== ownUserId && (
+                        <button
+                          onClick={() => onRemoveAdmin(admin.user_id)}
+                          className="p-1.5 rounded-lg transition-all"
+                          style={{ color: 'var(--text-tertiary)' }}
+                          title="Quitar administrador"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {platformAdmins.length === 0 && (
+                <p className="text-center text-xs font-bold py-4" style={{ color: 'var(--text-tertiary)' }}>Sin administradores todavía.</p>
+              )}
+            </div>
+          </div>
+
+          {/* Search GHL users to promote */}
+          <div>
+            <label className="text-[11px] font-black uppercase tracking-wider mb-2 block" style={{ color: 'var(--text-tertiary)' }}>Usuario de GoHighLevel</label>
+            <div className="relative">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-tertiary)' }} />
+              <input
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                placeholder="Buscar por nombre o correo..."
+                className="w-full pl-9 pr-3 py-2.5 rounded-xl text-sm font-bold outline-none"
+                style={{ background: 'var(--input-bg)', border: '1px solid var(--input-border)', color: 'var(--text-primary)' }}
+              />
+            </div>
+            {searching && <p className="text-[10px] font-bold mt-1.5" style={{ color: 'var(--text-tertiary)' }}>Buscando…</p>}
+            {!searching && searchError && <p className="text-[10px] font-bold mt-1.5" style={{ color: 'var(--accent)' }}>{searchError}</p>}
+            {!searching && !searchError && query.trim().length >= 2 && results.length === 0 && (
+              <p className="text-[10px] font-bold mt-1.5" style={{ color: 'var(--text-tertiary)' }}>Sin resultados para "{query.trim()}".</p>
+            )}
+            {results.length > 0 && (
+              <div className="mt-1.5 rounded-xl overflow-hidden" style={{ border: '1px solid var(--border-glass)' }}>
+                {results.map(u => {
+                  const alreadyAdmin = platformAdmins.some(a => a.user_id === u.id);
+                  return (
+                    <button
+                      key={u.id}
+                      disabled={alreadyAdmin}
+                      onClick={() => { setSelectedCandidate(u); setPermissions({}); setPassword(''); }}
+                      className="w-full flex flex-col items-start px-3 py-2 text-left disabled:opacity-40"
+                      style={{ background: 'var(--bg-elevated)', borderBottom: '1px solid var(--border-glass)' }}
+                    >
+                      <span className="text-xs font-black" style={{ color: 'var(--text-primary)' }}>{u.nombre || u.correo}</span>
+                      <span className="text-[10px] font-bold" style={{ color: 'var(--text-tertiary)' }}>{u.correo}{u.nombre_dealer ? ` · ${u.nombre_dealer}` : ''}{alreadyAdmin ? ' · Ya es admin' : ''}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {!manualMode ? (
+              <button
+                onClick={() => { setManualMode(true); setManualEmail(query.trim().includes('@') ? query.trim() : ''); setManualName(''); }}
+                className="text-[11px] font-bold mt-3 underline"
+                style={{ color: 'var(--text-secondary)' }}
+              >
+                ¿No aparece? Agregarlo manualmente
+              </button>
+            ) : (
+              <div className="mt-3 p-3 rounded-xl space-y-2" style={{ background: 'var(--input-bg)', border: '1px solid var(--border-glass)' }}>
+                <p className="text-[10px] font-black uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>Agregar manualmente</p>
+                <input
+                  type="email"
+                  value={manualEmail}
+                  onChange={e => setManualEmail(e.target.value)}
+                  placeholder="Correo electrónico"
+                  className="w-full px-3 py-2.5 rounded-xl text-sm font-bold outline-none"
+                  style={{ background: 'var(--bg-elevated)', border: '1px solid var(--input-border)', color: 'var(--text-primary)' }}
+                />
+                <input
+                  value={manualName}
+                  onChange={e => setManualName(e.target.value)}
+                  placeholder="Nombre de usuario"
+                  className="w-full px-3 py-2.5 rounded-xl text-sm font-bold outline-none"
+                  style={{ background: 'var(--bg-elevated)', border: '1px solid var(--input-border)', color: 'var(--text-primary)' }}
+                />
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={handleContinueManual}
+                    disabled={!emailValid}
+                    className="flex-1 py-2 rounded-xl text-xs font-black transition-all disabled:opacity-40"
+                    style={{ background: 'var(--accent)', color: '#fff' }}
+                  >
+                    Continuar
+                  </button>
+                  <button
+                    onClick={() => { setManualMode(false); setManualEmail(''); setManualName(''); }}
+                    className="px-3 py-2 rounded-xl text-xs font-black transition-all"
+                    style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)' }}
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {isFormOpen && (
+        <div className="max-w-xl">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <div className="text-sm font-black" style={{ color: 'var(--text-primary)' }}>{editingAdmin ? (editingAdmin.nombre || editingAdmin.correo) : (selectedCandidate.nombre || selectedCandidate.correo)}</div>
+              <div className="text-[10px] font-bold" style={{ color: 'var(--text-tertiary)' }}>{editingAdmin ? editingAdmin.correo : selectedCandidate.correo}</div>
+            </div>
+            <button onClick={resetForm} className="p-1.5 rounded-lg" style={{ color: 'var(--text-secondary)' }}><X size={16} /></button>
+          </div>
+
+          <label className="text-[10px] font-black uppercase tracking-wider mb-1.5 block" style={{ color: 'var(--text-tertiary)' }}>Permisos</label>
+          <PanelMasterPermissionChecklist value={permissions} onChange={setPermissions} />
+
+          <label className="text-[10px] font-black uppercase tracking-wider mt-3 mb-1.5 block" style={{ color: 'var(--text-tertiary)' }}>
+            Contraseña {editingAdmin ? '(dejar vacío para no cambiar)' : ''}
+          </label>
+          <input
+            type="password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            placeholder="Mínimo 8 caracteres"
+            className="w-full px-3 py-2.5 rounded-xl text-sm font-bold outline-none"
+            style={{ background: 'var(--input-bg)', border: '1px solid var(--input-border)', color: 'var(--text-primary)' }}
+          />
+
+          <button
+            onClick={handleSubmit}
+            disabled={submitting}
+            className="w-full mt-4 py-3 rounded-2xl font-black text-sm transition-all active:scale-[0.98] disabled:opacity-50"
+            style={{ background: 'var(--accent)', color: '#fff', boxShadow: 'var(--accent-glow)' }}
+          >
+            {submitting ? 'Guardando…' : (editingAdmin ? 'Actualizar Administrador' : 'Agregar Administrador')}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// logo_url a veces apunta a un archivo borrado/inaccesible (Storage limpiado,
+// URL firmada expirada, CORS) — sin onError el <img> se queda en el ícono
+// roto del navegador para siempre. Con hasError, cae a las iniciales igual
+// que cuando no hay logo_url.
+const DealerLogoBox = ({ logoUrl, initials, hue, grayscale = false, ghlConnected = false }) => {
+  const [hasError, setHasError] = useState(false);
+  const showImage = !!logoUrl && !hasError;
+
+  return (
+    <div
+      className={`w-20 h-20 rounded-2xl shrink-0 flex items-center justify-center overflow-hidden relative ${grayscale ? 'grayscale' : ''}`}
+      style={{
+        background: showImage ? 'var(--input-bg)' : (grayscale ? 'var(--bg-elevated)' : `hsl(${hue}, 55%, 46%)`),
+        border: '1px solid var(--border-glass)'
+      }}
+    >
+      {showImage
+        ? (
+          <img
+            src={logoUrl}
+            alt=""
+            className={`w-full h-full object-contain ${grayscale ? 'p-2' : 'p-2.5'}`}
+            onError={() => setHasError(true)}
+          />
+        )
+        : (
+          <span className={grayscale ? 'text-lg font-black' : 'text-2xl font-black text-white'} style={grayscale ? { color: 'var(--text-tertiary)' } : undefined}>
+            {initials}
+          </span>
+        )
+      }
+      {ghlConnected && (
+        <div className="absolute bottom-1.5 right-1.5 w-2.5 h-2.5 rounded-full" style={{ background: '#22A745', border: '2px solid var(--bg-elevated)' }} title="Conectado a GHL" />
+      )}
+    </div>
+  );
+};
+
+const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect, isSuperAdmin, onSoftDelete, onRecover, onCreateDealer, canInstall, canDelete, canEnterAnyAccount, canManageAdmins, platformAdmins, ownUserId, onSearchUsers, onAddAdmin, onUpdateAdmin, onRemoveAdmin, showToast }) => {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [tab, setTab] = useState('dealers');
 
   if (!isOpen) return null;
 
@@ -5925,68 +7829,102 @@ const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect, isSuperAdmin,
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
-      style={{ background: 'rgba(0,0,0,0.72)', backdropFilter: 'blur(12px)' }}
+      className="fixed inset-0 z-[9999] flex items-center justify-center p-3 sm:p-6 lg:p-10"
+      style={{ background: 'rgba(0,0,0,0.45)', backdropFilter: 'blur(12px)' }}
     >
       <motion.div
-        initial={{ opacity: 0, scale: 0.96, y: 24 }}
+        initial={{ opacity: 0, scale: 0.97, y: 16 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
         style={{
-          background: 'linear-gradient(160deg, #1a1d27 0%, #13151e 100%)',
-          border: '1px solid rgba(255,255,255,0.08)',
-          borderRadius: '2rem',
-          boxShadow: '0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04) inset',
+          background: 'var(--bg-glass-heavy)',
+          backdropFilter: 'blur(var(--blur-glass)) saturate(180%)',
+          WebkitBackdropFilter: 'blur(var(--blur-glass)) saturate(180%)',
+          border: '1px solid var(--border-glass)',
+          borderRadius: '1.75rem',
+          boxShadow: 'var(--shadow-modal)',
         }}
-        className="w-full max-w-md overflow-hidden"
+        className="w-full max-w-6xl h-full max-h-[92vh] overflow-hidden flex flex-col"
       >
         {/* Header */}
-        <div className="relative px-6 pt-6 pb-4 flex items-start justify-between">
+        <div className="relative px-6 sm:px-10 pt-8 pb-5 flex items-start justify-between shrink-0" style={{ borderBottom: '1px solid var(--divider)' }}>
           <div
-            className="absolute inset-0 opacity-30 pointer-events-none"
-            style={{ background: 'radial-gradient(ellipse 60% 50% at 20% 0%, rgba(255,59,48,0.18) 0%, transparent 70%)' }}
+            className="absolute inset-0 opacity-60 pointer-events-none"
+            style={{ background: 'radial-gradient(ellipse 60% 50% at 20% 0%, var(--accent-soft) 0%, transparent 70%)' }}
           />
           <div className="relative">
-            <div className="flex items-center gap-2.5 mb-1">
-              <div className="w-7 h-7 rounded-xl flex items-center justify-center" style={{ background: 'rgba(255,59,48,0.15)', border: '1px solid rgba(255,59,48,0.25)' }}>
-                <Building2 size={14} style={{ color: '#FF3B30' }} />
+            <div className="flex items-center gap-2.5 mb-1.5">
+              <div className="w-7 h-7 rounded-xl flex items-center justify-center" style={{ background: 'var(--accent-soft)', border: '1px solid var(--accent-surface)' }}>
+                <Building2 size={14} style={{ color: 'var(--accent)' }} />
               </div>
-              <span className="text-[10px] font-black tracking-[0.18em] uppercase" style={{ color: 'rgba(255,255,255,0.35)' }}>Super Admin</span>
+              <span className="text-[10px] font-black tracking-[0.18em] uppercase" style={{ color: 'var(--text-tertiary)' }}>Panel Master</span>
             </div>
-            <h2 className="text-xl font-black tracking-tight" style={{ color: '#F5F5F7' }}>Seleccionar Cuenta</h2>
-            <p className="text-xs font-medium mt-0.5" style={{ color: 'rgba(255,255,255,0.35)' }}>{sortedDealers.filter(d => !d.deleted_at).length} cuentas activas</p>
+            <h2 className="text-2xl font-black tracking-tight" style={{ color: 'var(--text-primary)' }}>{tab === 'team' ? 'Equipo' : 'Seleccionar Cuenta'}</h2>
+            <p className="text-xs font-medium mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+              {tab === 'team' ? `${platformAdmins?.length || 0} administradores` : `${sortedDealers.filter(d => !d.deleted_at).length} cuentas activas`}
+            </p>
           </div>
           <button
             onClick={onClose}
-            className="relative p-2 rounded-xl transition-all duration-200 hover:scale-105 active:scale-95"
-            style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.4)' }}
+            className="relative p-2.5 rounded-xl transition-all duration-200 hover:scale-105 active:scale-95"
+            style={{ background: 'var(--input-bg)', border: '1px solid var(--border-glass)', color: 'var(--text-secondary)' }}
           >
             <X size={18} />
           </button>
         </div>
 
+        {/* Tabs */}
+        {canManageAdmins && (
+          <div className="px-6 sm:px-10 pt-4 pb-1 flex items-center gap-2 shrink-0">
+            {[{ id: 'dealers', label: 'Cuentas' }, { id: 'team', label: 'Equipo' }].map(tb => (
+              <button
+                key={tb.id}
+                onClick={() => setTab(tb.id)}
+                className="px-4 py-1.5 rounded-full text-[11px] font-black uppercase tracking-wide transition-all"
+                style={tab === tb.id
+                  ? { background: 'var(--accent)', color: '#fff', boxShadow: 'var(--accent-glow)' }
+                  : { background: 'var(--input-bg)', color: 'var(--text-secondary)' }}
+              >
+                {tb.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {tab === 'team' ? (
+          <PanelMasterTeamTab
+            platformAdmins={platformAdmins || []}
+            ownUserId={ownUserId}
+            canManageAdmins={canManageAdmins}
+            onSearchUsers={onSearchUsers}
+            onAddAdmin={onAddAdmin}
+            onUpdateAdmin={onUpdateAdmin}
+            onRemoveAdmin={onRemoveAdmin}
+            showToast={showToast}
+          />
+        ) : (
+        <>
         {/* List */}
-        <div className="px-3 pb-2 max-h-[52vh] overflow-y-auto" style={{ scrollbarWidth: 'none' }}>
-          <div className="flex flex-col gap-1.5">
+        <div className="px-6 sm:px-10 py-6 flex-1 overflow-y-auto" style={{ scrollbarWidth: 'none' }}>
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-4">
             {sortedDealers.map((dealer) => {
               const isPendingDelete = !!dealer.deleted_at;
               const timeLeft = isPendingDelete ? getTimeLeft(dealer.deleted_at) : null;
               const isConfirming = confirmDeleteId === dealer.id;
               const initials = dealer.nombre.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+              const hue = (dealer.nombre.charCodeAt(0) * 37) % 360;
 
               if (isPendingDelete) {
                 return (
-                  <div key={dealer.id} className="flex items-center gap-3 px-3 py-3 rounded-2xl opacity-40" style={{ background: 'rgba(255,255,255,0.03)' }}>
-                    <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 grayscale" style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.06)' }}>
-                      {dealer.logo_url ? <img src={dealer.logo_url} alt="" className="w-full h-full object-contain rounded-xl p-1" /> : <span className="text-xs font-black text-white/40">{initials}</span>}
+                  <div key={dealer.id} className="flex flex-col items-center text-center gap-3 p-5 rounded-3xl opacity-50" style={{ background: 'var(--input-bg)', border: '1px solid var(--border-glass)' }}>
+                    <DealerLogoBox logoUrl={dealer.logo_url} initials={initials} hue={hue} grayscale />
+                    <div className="min-w-0 w-full">
+                      <div className="text-sm font-black uppercase line-through truncate" style={{ color: 'var(--text-tertiary)' }}>{dealer.nombre}</div>
+                      <div className="text-[10px] font-bold mt-0.5" style={{ color: 'var(--text-tertiary)' }}>{timeLeft ? `Eliminando en ${timeLeft}` : 'Eliminando…'}</div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-black uppercase line-through truncate" style={{ color: 'rgba(255,255,255,0.3)' }}>{dealer.nombre}</div>
-                      <div className="text-[10px] font-bold mt-0.5" style={{ color: 'rgba(255,255,255,0.2)' }}>{timeLeft ? `Eliminando en ${timeLeft}` : 'Eliminando…'}</div>
-                    </div>
-                    {isSuperAdmin && (
-                      <button onClick={() => onRecover(dealer.id)} className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-black transition-all" style={{ background: 'rgba(52,199,89,0.12)', border: '1px solid rgba(52,199,89,0.2)', color: '#34C759' }}>
-                        <Undo size={12} /> Recuperar
+                    {canDelete && (
+                      <button onClick={() => onRecover(dealer.id)} className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-black transition-all" style={{ background: 'rgba(52,199,89,0.12)', border: '1px solid rgba(52,199,89,0.25)', color: '#22A745' }}>
+                        <Undo size={13} /> Recuperar
                       </button>
                     )}
                   </div>
@@ -5994,61 +7932,48 @@ const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect, isSuperAdmin,
               }
 
               return (
-                <div key={dealer.id} className="relative group">
+                <div key={dealer.id} className="flex flex-col items-center text-center gap-3 p-5 rounded-3xl transition-all duration-200" style={{ background: 'var(--bg-glass)', backdropFilter: 'blur(var(--blur-glass)) saturate(160%)', WebkitBackdropFilter: 'blur(var(--blur-glass)) saturate(160%)', border: '1px solid var(--border-glass)', boxShadow: 'var(--shadow-card)' }}>
+                  {/* Big logo */}
+                  <DealerLogoBox logoUrl={dealer.logo_url} initials={initials} hue={hue} ghlConnected={!!dealer.ghl_location_id} />
+
+                  {/* Info */}
+                  <div className="min-w-0 w-full">
+                    <div className="text-sm font-black uppercase leading-tight truncate" style={{ color: 'var(--text-primary)' }}>{dealer.nombre}</div>
+                    <div className="text-[10px] font-bold mt-0.5 tracking-wider uppercase truncate" style={{ color: 'var(--text-tertiary)' }}>
+                      {dealer.ghl_location_id ? `GHL · ${dealer.id_busqueda || dealer.id.slice(0, 8)}` : dealer.id_busqueda || dealer.id.slice(0, 8)}
+                    </div>
+                  </div>
+
+                  {/* Actions */}
                   {isConfirming ? (
-                    <div className="flex items-center gap-2.5 px-3 py-3 rounded-2xl" style={{ background: 'rgba(255,59,48,0.08)', border: '1px solid rgba(255,59,48,0.2)' }}>
-                      <AlertTriangle size={16} style={{ color: '#FF3B30' }} className="shrink-0" />
-                      <div className="flex-1 text-xs font-bold" style={{ color: 'rgba(255,59,48,0.9)' }}>
-                        ¿Eliminar <span className="uppercase font-black">{dealer.nombre}</span>? 24h para recuperar.
+                    <div className="w-full flex flex-col gap-1.5">
+                      <p className="text-[10px] font-bold" style={{ color: 'var(--accent)' }}>¿Eliminar? 24h para recuperar.</p>
+                      <div className="flex gap-1.5">
+                        <button onClick={() => { onSoftDelete(dealer.id); setConfirmDeleteId(null); }} className="flex-1 py-2 rounded-xl text-xs font-black transition-all" style={{ background: 'var(--accent)', color: '#fff' }}>Eliminar</button>
+                        <button onClick={() => setConfirmDeleteId(null)} className="flex-1 py-2 rounded-xl text-xs font-black transition-all" style={{ background: 'var(--input-bg)', color: 'var(--text-secondary)' }}>No</button>
                       </div>
-                      <button onClick={() => { onSoftDelete(dealer.id); setConfirmDeleteId(null); }} className="px-2.5 py-1.5 rounded-xl text-xs font-black transition-all hover:opacity-80" style={{ background: '#FF3B30', color: '#fff' }}>Eliminar</button>
-                      <button onClick={() => setConfirmDeleteId(null)} className="px-2.5 py-1.5 rounded-xl text-xs font-black transition-all" style={{ background: 'rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.5)' }}>No</button>
                     </div>
                   ) : (
-                    <button
-                      onClick={() => onSelect(dealer)}
-                      className="w-full flex items-center gap-3 px-3 py-3 rounded-2xl transition-all duration-200 text-left active:scale-[0.98] group/btn"
-                      style={{ background: 'rgba(255,255,255,0.0)' }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
-                      onMouseLeave={e => e.currentTarget.style.background = 'rgba(255,255,255,0.0)'}
-                    >
-                      {/* Logo / Avatar */}
-                      <div className="w-11 h-11 rounded-xl shrink-0 flex items-center justify-center overflow-hidden relative" style={{ background: dealer.logo_url ? 'rgba(255,255,255,0.06)' : `hsl(${(dealer.nombre.charCodeAt(0) * 37) % 360}, 50%, 25%)`, border: '1px solid rgba(255,255,255,0.08)' }}>
-                        {dealer.logo_url
-                          ? <img src={dealer.logo_url} alt="" className="w-full h-full object-contain p-1.5" />
-                          : <span className="text-sm font-black" style={{ color: `hsl(${(dealer.nombre.charCodeAt(0) * 37) % 360}, 80%, 75%)` }}>{initials}</span>
-                        }
-                      </div>
-                      {/* Info */}
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-black uppercase leading-tight truncate transition-colors duration-200" style={{ color: '#F5F5F7' }}
-                          onMouseEnter={e => e.currentTarget.style.color = '#FF3B30'}
-                          onMouseLeave={e => e.currentTarget.style.color = '#F5F5F7'}
-                        >{dealer.nombre}</div>
-                        <div className="text-[10px] font-bold mt-0.5 tracking-wider uppercase truncate" style={{ color: 'rgba(255,255,255,0.25)' }}>
-                          {dealer.ghl_location_id ? `GHL · ${dealer.id_busqueda || dealer.id.slice(0,8)}` : dealer.id_busqueda || dealer.id.slice(0,8)}
-                        </div>
-                      </div>
-                      {/* GHL badge */}
-                      {dealer.ghl_location_id && (
-                        <div className="shrink-0 w-2 h-2 rounded-full" style={{ background: '#34C759', boxShadow: '0 0 6px rgba(52,199,89,0.6)' }} title="Conectado a GHL" />
+                    <div className="w-full flex gap-1.5">
+                      <button
+                        onClick={() => canEnterAnyAccount && onSelect(dealer)}
+                        disabled={!canEnterAnyAccount}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-black transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ background: 'var(--accent)', color: '#fff', boxShadow: 'var(--accent-glow)' }}
+                      >
+                        Entrar <ArrowRight size={13} />
+                      </button>
+                      {canDelete && (
+                        <button
+                          onClick={() => setConfirmDeleteId(dealer.id)}
+                          className="w-9 flex items-center justify-center rounded-xl transition-all active:scale-95"
+                          style={{ background: 'var(--input-bg)', color: 'var(--text-tertiary)' }}
+                          title="Eliminar cuenta"
+                        >
+                          <Trash2 size={14} />
+                        </button>
                       )}
-                      {/* Arrow */}
-                      <div className="shrink-0 w-7 h-7 rounded-xl flex items-center justify-center transition-all duration-200" style={{ background: 'rgba(255,255,255,0.05)', color: 'rgba(255,255,255,0.2)' }}>
-                        <ArrowRight size={14} />
-                      </div>
-                    </button>
-                  )}
-                  {isSuperAdmin && !isConfirming && (
-                    <button
-                      onClick={e => { e.stopPropagation(); setConfirmDeleteId(dealer.id); }}
-                      className="absolute right-10 top-1/2 -translate-y-1/2 p-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-all duration-200"
-                      style={{ color: 'rgba(255,255,255,0.25)' }}
-                      onMouseEnter={e => { e.currentTarget.style.color = '#FF3B30'; e.currentTarget.style.background = 'rgba(255,59,48,0.1)'; }}
-                      onMouseLeave={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.25)'; e.currentTarget.style.background = 'transparent'; }}
-                    >
-                      <Trash2 size={13} />
-                    </button>
+                    </div>
                   )}
                 </div>
               );
@@ -6057,29 +7982,30 @@ const DealerSwitcherModal = ({ isOpen, onClose, dealers, onSelect, isSuperAdmin,
         </div>
 
         {/* Footer */}
-        <div className="px-4 pb-5 pt-3 space-y-2.5" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-          {isSuperAdmin && (
+        <div className="px-6 sm:px-10 pb-6 pt-3 space-y-2.5 shrink-0" style={{ borderTop: '1px solid var(--divider)' }}>
+          {canInstall && (
             <button
               onClick={handleInstallNew}
               className="w-full flex items-center justify-center gap-2.5 py-3 rounded-2xl font-black text-sm transition-all duration-200 active:scale-[0.98] hover:opacity-90"
               style={{
-                background: 'linear-gradient(135deg, rgba(255,59,48,0.15) 0%, rgba(255,59,48,0.08) 100%)',
-                border: '1px solid rgba(255,59,48,0.3)',
-                color: '#FF6B63',
-                boxShadow: '0 0 20px rgba(255,59,48,0.08) inset',
+                background: 'var(--accent)',
+                color: '#fff',
+                boxShadow: 'var(--accent-glow)',
               }}
             >
-              <div className="w-5 h-5 rounded-lg flex items-center justify-center" style={{ background: 'rgba(255,59,48,0.2)' }}>
-                <Plus size={12} style={{ color: '#FF3B30' }} />
+              <div className="w-5 h-5 rounded-lg flex items-center justify-center" style={{ background: 'rgba(255,255,255,0.18)' }}>
+                <Plus size={12} style={{ color: '#fff' }} />
               </div>
               Instalar en Nueva Subcuenta
-              <ArrowRight size={14} style={{ color: 'rgba(255,107,99,0.6)' }} />
+              <ArrowRight size={14} />
             </button>
           )}
-          <p className="text-center text-[9px] font-black uppercase tracking-[0.2em]" style={{ color: 'rgba(255,255,255,0.15)' }}>
-            CarBot System · Super Admin
+          <p className="text-center text-[9px] font-black uppercase tracking-[0.2em]" style={{ color: 'var(--text-tertiary)' }}>
+            CarBot System · Panel Master
           </p>
         </div>
+        </>
+        )}
       </motion.div>
     </div>,
     document.body
@@ -6128,6 +8054,9 @@ export default function CarbotApp() {
   const [initializing, setInitializing] = useState(true);
   const [isInventoryLoading, setIsInventoryLoading] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
+  // Gate de arranque: no mostrar la app hasta tener perfil + primer inventario cargados.
+  const [inventoryReady, setInventoryReady] = useState(false);
+  const [forceReady, setForceReady] = useState(false); // bypass de seguridad (timeout)
 
   const [activeTab, setActiveTab] = useState(() => {
     if (isStoreRoute) return 'inventory';
@@ -6181,19 +8110,27 @@ export default function CarbotApp() {
   // --- SAFETY: Loading Timeout ---
   useEffect(() => {
     const timer = setTimeout(() => {
-      if (initializing || ghlSSOLoading) {
-        console.warn("⚠️ App initialization timed out! Forcing loading screens off.");
-        setInitializing(false);
-        setGhlSSOLoading(false);
-        setAuthChecked(true); 
-      }
+      console.warn("⚠️ App initialization timed out! Forcing loading screens off.");
+      setInitializing(false);
+      setGhlSSOLoading(false);
+      setAuthChecked(true);
+      setForceReady(true); // bypass del gate de datos para no quedar atascados
     }, 10000); // 10s safety margin
     return () => clearTimeout(timer);
-  }, [initializing, ghlSSOLoading]);
+  }, []);
 
   const [isSuperAdmin, setIsSuperAdmin] = useState(false);
   const [showDealerSwitcher, setShowDealerSwitcher] = useState(false);
   const [allDealers, setAllDealers] = useState([]);
+  const [platformAdmin, setPlatformAdmin] = useState(null); // own platform_admins row, if any
+  const [platformAdminsList, setPlatformAdminsList] = useState([]); // full team, for the Equipo tab
+  const isPlatformAdminUser = !!platformAdmin;
+  const hasPanelPermission = useCallback((perm) => {
+    if (isSuperAdmin) return true;
+    if (!platformAdmin) return false;
+    if (platformAdmin.is_super_admin) return true;
+    return platformAdmin.permissions?.[perm] === true;
+  }, [isSuperAdmin, platformAdmin]);
 
   const [selectedVehicle, setSelectedVehicle] = useState(null);
   const [isContractModalOpen, setIsContractModalOpen] = useState(false);
@@ -6203,10 +8140,25 @@ export default function CarbotApp() {
   useEffect(() => { localStorage.setItem('activeTab', activeTab); }, [activeTab]);
 
   const { t } = useI18n();
+  const { isDark } = useTheme();
   const showToast = (message, type = 'success') => {
-    if (type === 'error') sileo.error(message);
-    else if (type === 'warning') sileo.warning(message);
-    else sileo.success(message);
+    // Toast corto y legible: título de estado breve ("Listo" / "Error" / "Atención")
+    // sobre fondo oscuro (el texto de sileo usa el color del estado — verde/rojo/ámbar —
+    // que sobre blanco casi no se lee). El detalle completo queda en consola.
+    const titles = {
+      success: t('toast_title_success'),
+      error: t('toast_title_error'),
+      warning: t('toast_title_warning'),
+    };
+    if (type === 'error') {
+      // Fondo rojo + texto blanco
+      sileo.error({ title: titles.error, fill: '#dc2626', roundness: 16, styles: { title: 'toast-title-white', badge: 'toast-badge-white' } });
+    } else if (type === 'warning') {
+      sileo.warning({ title: titles.warning, fill: '#f59e0b', roundness: 16, styles: { title: 'toast-title-white', badge: 'toast-badge-white' } });
+    } else {
+      // Fondo blanco + "Listo" en verde agradable
+      sileo.success({ title: titles.success, fill: '#ffffff', roundness: 16, styles: { title: 'toast-title-green', badge: 'toast-badge-green' } });
+    }
   };
 
 
@@ -6372,20 +8324,86 @@ export default function CarbotApp() {
 
   // --- 1.c FETCH ALL DEALERS FOR SUPERADMIN ---
   const refreshAllDealers = useCallback(async () => {
-    if (!isSuperAdmin) return;
+    if (!isSuperAdmin && !hasPanelPermission('view_all_dealers')) return;
     // Purge dealers whose 24h window has expired before fetching
-    await supabase
-      .from('dealers')
-      .delete()
-      .not('deleted_at', 'is', null)
-      .lt('deleted_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    if (isSuperAdmin || hasPanelPermission('delete_dealer')) {
+      await supabase
+        .from('dealers')
+        .delete()
+        .not('deleted_at', 'is', null)
+        .lt('deleted_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    }
     const { data } = await supabase.from('dealers').select('*').order('nombre', { ascending: true });
     if (data) setAllDealers(data);
-  }, [isSuperAdmin]);
+  }, [isSuperAdmin, hasPanelPermission]);
 
   useEffect(() => {
     refreshAllDealers();
   }, [refreshAllDealers]);
+
+  // --- 1.d PANEL MASTER: own admin row + team roster ---
+  const refreshPlatformAdmin = useCallback(async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session?.user) { setPlatformAdmin(null); return; }
+    const { data } = await supabase
+      .from('platform_admins')
+      .select('*')
+      .eq('user_id', session.user.id)
+      .maybeSingle();
+    setPlatformAdmin(data || null);
+  }, []);
+
+  useEffect(() => { refreshPlatformAdmin(); }, [refreshPlatformAdmin, isLoggedIn]);
+
+  const refreshPlatformAdminsList = useCallback(async () => {
+    if (!isSuperAdmin && !hasPanelPermission('manage_admins')) return;
+    const { data } = await supabase.from('platform_admins').select('*').order('created_at', { ascending: true });
+    if (data) setPlatformAdminsList(data);
+  }, [isSuperAdmin, hasPanelPermission]);
+
+  useEffect(() => { refreshPlatformAdminsList(); }, [refreshPlatformAdminsList]);
+
+  // Calls the panel-master Edge Function (service-role only writes: add/update/remove admin).
+  const callPanelMaster = useCallback(async (action, payload = {}) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session?.access_token) throw new Error('Sesión no válida.');
+    const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/panel-master`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session.access_token}`,
+      },
+      body: JSON.stringify({ action, ...payload }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.message || data?.error || 'Error en el servidor.');
+    return data;
+  }, []);
+
+  const handleSearchGhlUsers = useCallback(async (query) => {
+    const q = (query || '').trim();
+    if (q.length < 2) return [];
+    const data = await callPanelMaster('search_users', { query: q });
+    return data?.users || [];
+  }, [callPanelMaster]);
+
+  const handleAddPlatformAdmin = useCallback(async ({ usuario_id, correo, nombre, permissions, password }) => {
+    await callPanelMaster('add_admin', { usuario_id, correo, nombre, permissions, password });
+    showToast('Administrador agregado.', 'success');
+    await refreshPlatformAdminsList();
+  }, [callPanelMaster, refreshPlatformAdminsList]);
+
+  const handleUpdatePlatformAdmin = useCallback(async ({ user_id, permissions, password }) => {
+    await callPanelMaster('update_admin', { user_id, permissions, password });
+    showToast('Administrador actualizado.', 'success');
+    await refreshPlatformAdminsList();
+  }, [callPanelMaster, refreshPlatformAdminsList]);
+
+  const handleRemovePlatformAdmin = useCallback(async (user_id) => {
+    await callPanelMaster('remove_admin', { user_id });
+    showToast('Administrador eliminado.', 'success');
+    await refreshPlatformAdminsList();
+  }, [callPanelMaster, refreshPlatformAdminsList]);
 
   const handleSoftDeleteDealer = useCallback(async (dealerId) => {
     const { error } = await supabase
@@ -6538,7 +8556,29 @@ export default function CarbotApp() {
         try {
           const emailLower = currentUserEmail.toLowerCase();
           const userId = emailLower.replace(/\./g, '_');
-          const manualSelectedDealerId = localStorage.getItem(`selected_dealer_${userId}`);
+          let manualSelectedDealerId = localStorage.getItem(`selected_dealer_${userId}`);
+
+          // GUARDA MULTI-TENANT: el dealer seleccionado manualmente (SuperAdmin) puede haber
+          // sido eliminado. Si su UUID ya no existe en Supabase, limpiamos la selección obsoleta
+          // para no arrastrar un perfil/nombre fantasma (ej. un dealer borrado que sigue saliendo).
+          if (emailLower === 'jeancarlosgf13@gmail.com' && manualSelectedDealerId) {
+            try {
+              const { data: liveDealer } = await supabase
+                .from('dealers')
+                .select('id')
+                .eq('id', manualSelectedDealerId)
+                .maybeSingle();
+              if (!liveDealer) {
+                console.warn('🧹 Dealer seleccionado ya no existe — limpiando selección obsoleta:', manualSelectedDealerId);
+                localStorage.removeItem(`selected_dealer_${userId}`);
+                manualSelectedDealerId = null;
+              }
+            } catch (e) {
+              // Si la verificación falla (red/RLS), no bloqueamos el login: mantenemos la selección.
+              console.warn('⚠️ No se pudo verificar el dealer seleccionado:', e?.message);
+            }
+          }
+
           let profileData = null;
           let dealerIdToUse = (emailLower === 'jeancarlosgf13@gmail.com' && manualSelectedDealerId)
             ? manualSelectedDealerId
@@ -6558,16 +8598,18 @@ export default function CarbotApp() {
             // Intentar enriquecer con datos de Supabase (logo, etc.) — no bloqueante
             let supaLogo = '';
             let supaUuid = dealerIdToUse;
+            let supaDealer = null;
             try {
-              const { data: supaDealer } = await supabase
+              const { data } = await supabase
                 .from('dealers')
                 .select('id, nombre, logo_url, has_bot, bot_name, catalogo_url')
                 .eq('ghl_location_id', urlLocationId)
                 .maybeSingle();
-              if (supaDealer) {
-                supaLogo = supaDealer.logo_url || '';
-                supaUuid = supaDealer.id;
-                console.log('✅ Supabase enriqueció con logo y UUID:', supaDealer.nombre);
+              if (data) {
+                supaDealer = data;
+                supaLogo = data.logo_url || '';
+                supaUuid = data.id;
+                console.log('✅ Supabase enriqueció con logo y UUID:', data.nombre);
               }
             } catch (e) {
               console.warn('⚠️ Supabase lookup failed (RLS?) — continuando sin logo:', e.message);
@@ -6616,7 +8658,8 @@ export default function CarbotApp() {
           }
 
           // 2. BUSQUEDA GLOBAL: collectionGroup (Solo para Manual Login o si no hay dealerIdToUse específico)
-          if (!profileData && !dealerIdToUse) {
+          // SuperAdmin sin selección válida NO usa heurísticas: debe ir al selector de dealer.
+          if (!profileData && !dealerIdToUse && emailLower !== 'jeancarlosgf13@gmail.com') {
             try {
               console.log("🔍 Buscando usuario vía Global Search...");
               const ugq = query(collectionGroup(db, "usuarios"), where("email", "==", emailLower));
@@ -6634,7 +8677,8 @@ export default function CarbotApp() {
           }
 
           // 3. RECUPERACIÓN (Escaneo Manual Seguro): Solo para Manual Login
-          if (!profileData && !dealerIdToUse) {
+          // SuperAdmin sin selección válida NO usa heurísticas: debe ir al selector de dealer.
+          if (!profileData && !dealerIdToUse && emailLower !== 'jeancarlosgf13@gmail.com') {
             try {
               console.log("⚡ Iniciando escaneo manual de seguridad...");
               const dealersSnap = await getDocs(collection(db, "Dealers"));
@@ -7031,23 +9075,6 @@ export default function CarbotApp() {
         console.warn("Supabase multi-account sync error:", supaUpdateErr);
       }
 
-      // Password Reset
-      if (updatedData.newPassword && updatedData.newPassword.length >= 6) {
-        if (auth.currentUser) {
-          try { await updatePassword(auth.currentUser, updatedData.newPassword); } catch (e) { }
-        }
-
-        const { error: supaErr } = await supabase.auth.updateUser({
-          password: updatedData.newPassword
-        });
-
-        if (supaErr) {
-          console.error("Supabase password error:", supaErr);
-          showToast("Error actualizando la contraseña", "error");
-          return;
-        }
-      }
-
       setUserProfile(prev => ({ ...prev, ...allowedUpdates }));
       showToast("Perfil actualizado");
     } catch (error) {
@@ -7070,30 +9097,6 @@ export default function CarbotApp() {
   };
 
   // Modal de bienvenida a notificaciones — aparece una sola vez por dispositivo
-  const NOTIF_SEEN_KEY = 'carbot_notif_welcome_seen';
-  const [showNotifWelcome, setShowNotifWelcome] = useState(false);
-
-  useEffect(() => {
-    if (!isLoggedIn) return;
-    // Solo mostrar si el navegador soporta notificaciones y aún no se ha visto
-    if (!('Notification' in window)) return;
-    if (Notification.permission === 'granted') return; // Ya tiene permiso, no molestar
-    if (localStorage.getItem(NOTIF_SEEN_KEY)) return;  // Ya vio el modal
-    // Pequeño delay para que la app termine de cargar antes de mostrar
-    const t = setTimeout(() => setShowNotifWelcome(true), 1500);
-    return () => clearTimeout(t);
-  }, [isLoggedIn]);
-
-  const handleNotifWelcomeActivate = async () => {
-    setShowNotifWelcome(false);
-    localStorage.setItem(NOTIF_SEEN_KEY, '1');
-    await requestNotificationPermission().catch(() => {});
-  };
-
-  const handleNotifWelcomeDismiss = () => {
-    setShowNotifWelcome(false);
-    localStorage.setItem(NOTIF_SEEN_KEY, '1');
-  };
 
   const handleDisconnectGhl = () => {
     requestConfirmation({
@@ -7210,6 +9213,7 @@ export default function CarbotApp() {
         // Sin dealerUuid no podemos cargar inventario de forma segura.
         setInventory([]);
         setIsInventoryLoading(false);
+        setInventoryReady(true);
         return;
       }
 
@@ -7287,7 +9291,8 @@ export default function CarbotApp() {
 
           ghlLocationId: v.ghl_location_id,
           createdAt: v.created_at,
-          updatedAt: v.created_at
+          updatedAt: v.updated_at || v.created_at,
+          lastChange: v.last_change || null
         };
       });
 
@@ -7299,6 +9304,9 @@ export default function CarbotApp() {
 
     } catch (err) {
       console.error("❌ Error fetch Supabase Vehiculos:", err);
+    } finally {
+      setIsInventoryLoading(false);
+      setInventoryReady(true);
     }
   }, [effectiveDealerId, userProfile, urlLocationId]);
 
@@ -7595,6 +9603,7 @@ export default function CarbotApp() {
       const {
         fotos, images, documentos, documents, image, // Multimedia (arrays/blobs)
         id, created_at, updated_at, dealer_id, // Columnas persistentes
+        link_externo, // Columna dedicada (no va en detalles)
         ...restDetails
       } = vehicleData;
 
@@ -7648,8 +9657,23 @@ export default function CarbotApp() {
 
         precio: pickNum(vehicleData.price, vehicleData.price_dop, vehicleData.precio, existingRecord?.precio),
         moneda_precio: pick(vehicleData.currency, existingRecord?.moneda_precio, 'USD'),
-        inicial: pickNum(vehicleData.initial_payment, vehicleData.initial_payment_dop, vehicleData.inicial, existingRecord?.inicial),
+        // pickNum descarta 0 y sigue buscando — correcto para "no tocó este campo",
+        // incorrecto para "el dealer marcó dejar el inicial vacío a propósito" (0 es
+        // el valor querido, no "faltante"). Si el formulario mandó explícitamente
+        // alguna de estas 3 llaves, se respeta tal cual (incluyendo 0); solo se cae a
+        // existingRecord cuando NINGUNA vino en el payload (ej. duplicar vehículo).
+        inicial: (
+          Object.prototype.hasOwnProperty.call(vehicleData, 'initial_payment') ||
+          Object.prototype.hasOwnProperty.call(vehicleData, 'initial_payment_dop') ||
+          Object.prototype.hasOwnProperty.call(vehicleData, 'inicial')
+        )
+          ? (Number(vehicleData.initial_payment ?? vehicleData.initial_payment_dop ?? vehicleData.inicial) || 0)
+          : (Number(existingRecord?.inicial) || 0),
         moneda_inicial: pick(vehicleData.downPaymentCurrency, existingRecord?.moneda_inicial, 'USD'),
+        // Marca si el inicial vino del % automático (no escrito a mano) — permite
+        // recalcular en bloque desde Ajustes cuando el dealer cambia el % o la
+        // tasa, sin arriesgar pisar un inicial real que el dealer tecleó.
+        inicial_automatico: typeof vehicleData.inicial_automatico === 'boolean' ? vehicleData.inicial_automatico : (existingRecord?.inicial_automatico ?? null),
         millas: pickNum(vehicleData.millas, vehicleData.mileage, existingRecord?.millas),
         cantidad_asientos: parseInt(pick(vehicleData.cantidad_asientos, vehicleData.seats, existingRecord?.cantidad_asientos) || 0),
 
@@ -7665,8 +9689,44 @@ export default function CarbotApp() {
         fotos: vehicleData.images || vehicleData.fotos || (vehicleData.image ? [vehicleData.image] : (existingRecord?.fotos || [])),
         documentos: vehicleData.documents || vehicleData.documentos || (existingRecord?.documentos || []),
 
+        // Link externo (Instagram/Drive/etc): null explícito limpia el valor previo
+        link_externo: (link_externo && link_externo.trim()) ? link_externo.trim() : null,
+
         detalles: mergedDetails
       };
+
+      // --- CHANGE LOG: comparar contra el registro previo para mostrar "qué cambió" en el UI ---
+      if (existingId && existingRecord) {
+        const CHANGE_FIELD_LABELS = {
+          anio: 'Año', marca: 'Marca', modelo: 'Modelo', edicion: 'Edición', tipo_vehiculo: 'Tipo',
+          estado: 'Estado', color: 'Color', condicion_carfax: 'Carfax', chasis_vin: 'VIN',
+          traccion: 'Tracción', transmision: 'Transmisión', motor: 'Motor', techo: 'Techo',
+          combustible: 'Combustible', llave: 'Llave', camara: 'Cámara', material_asientos: 'Asientos Material',
+          precio: 'Precio', moneda_precio: 'Moneda Precio', inicial: 'Inicial', moneda_inicial: 'Moneda Inicial',
+          millas: 'Millaje', cantidad_asientos: 'Cant. Asientos',
+          baul_electrico: 'Baúl Eléctrico', sensores: 'Sensores', carplay: 'CarPlay', vidrios_electricos: 'Vidrios Eléctricos',
+          link_externo: 'Link Externo'
+        };
+        const formatChangeValue = (key, val) => {
+          if (val === null || val === undefined || val === '') return '—';
+          if (typeof val === 'boolean') return val ? 'Sí' : 'No';
+          if (key === 'precio' || key === 'inicial' || key === 'millas') return Number(val).toLocaleString('en-US');
+          return String(val);
+        };
+        const cambios = [];
+        for (const [key, label] of Object.entries(CHANGE_FIELD_LABELS)) {
+          const before = existingRecord[key];
+          const after = dataToSave[key];
+          const beforeNorm = (before === null || before === undefined) ? '' : String(before).trim();
+          const afterNorm = (after === null || after === undefined) ? '' : String(after).trim();
+          if (beforeNorm !== afterNorm) {
+            cambios.push({ campo: label, antes: formatChangeValue(key, before), despues: formatChangeValue(key, after) });
+          }
+        }
+        if (cambios.length > 0) {
+          dataToSave.last_change = { fecha: new Date().toISOString(), cambios };
+        }
+      }
 
       if (existingId) {
         const { error } = await supabase.from('vehiculos').update(dataToSave).eq('id', existingId);
@@ -7691,7 +9751,9 @@ export default function CarbotApp() {
         }).catch(() => {});
       }
 
-      fetchVehiclesFromSupabase();
+      // Esperar el refetch: sin esto, la vista vuelve a la lista antes de que
+      // `inventory` refleje los cambios, mostrando datos viejos al reentrar.
+      await fetchVehiclesFromSupabase();
     } catch (error) {
       console.error("Error al guardar en Supabase:", error);
       const detailedError = error?.details || error?.hint || error?.message || 'Error desconocido';
@@ -7706,12 +9768,14 @@ export default function CarbotApp() {
     try {
       // Read current detalles, merge _deleted flag
       const { data: current } = await supabase.from('vehiculos').select('detalles').eq('id', id).single();
-      const updatedDetalles = { ...(current?.detalles || {}), _deleted: true, _deleted_at: new Date().toISOString() };
+      const deletedAt = new Date().toISOString();
+      const updatedDetalles = { ...(current?.detalles || {}), _deleted: true, _deleted_at: deletedAt };
       const { error } = await supabase.from('vehiculos').update({
-        detalles: updatedDetalles
+        detalles: updatedDetalles,
+        deleted_at: deletedAt
       }).eq('id', id);
       if (error) throw error;
-      setInventory(prev => prev.map(v => v.id === id ? { ...v, status: 'trash', detalles: updatedDetalles } : v));
+      setInventory(prev => prev.map(v => v.id === id ? { ...v, status: 'trash', detalles: updatedDetalles, deleted_at: deletedAt } : v));
       showToast(t('toast_vehicle_moved_trash'));
       fetchVehiclesFromSupabase();
     } catch (error) {
@@ -7729,10 +9793,11 @@ export default function CarbotApp() {
       delete updatedDetalles._deleted_at;
 
       const { error } = await supabase.from('vehiculos').update({
-        detalles: updatedDetalles
+        detalles: updatedDetalles,
+        deleted_at: null
       }).eq('id', id);
       if (error) throw error;
-      setInventory(prev => prev.map(v => v.id === id ? { ...v, status: 'available', detalles: updatedDetalles } : v));
+      setInventory(prev => prev.map(v => v.id === id ? { ...v, status: 'available', detalles: updatedDetalles, deleted_at: null } : v));
       showToast(t('toast_vehicle_restored'));
       fetchVehiclesFromSupabase();
     } catch (e) {
@@ -8032,6 +10097,23 @@ export default function CarbotApp() {
         setInventory(prev => prev.map(v =>
           String(v.id) === String(firstVehicleId) ? { ...v, estado: newEstado, status: newStatus } : v
         ));
+
+        // Registrar comprador real (integración Cloy postventa) cuando es venta firme, no cotización.
+        if (hasContract) {
+          const saleDoc = contractsArray.find(c => String(c.vehicleId) === String(firstVehicleId) && (c.category === 'contract' || !c.category));
+          const buyerName = saleDoc?.client;
+          if (buyerName) {
+            const dealerUuidForBuyer = userProfile?.supabaseDealerId || userProfile?.dealerId;
+            await supabase.from('compradores').insert([{
+              vehiculo_id: firstVehicleId,
+              dealer_id: dealerUuidForBuyer,
+              nombre: buyerName,
+              telefono: toE164(saleDoc.phone) || null,
+              cedula: saleDoc.cedula || null,
+              correo: saleDoc.email || null,
+            }]);
+          }
+        }
       }
 
       showToast(`${generatedCount} documentos generados con éxito`);
@@ -8156,6 +10238,19 @@ export default function CarbotApp() {
             setInventory(prev => prev.map(v =>
               String(v.id) === String(contractData.vehicleId) ? { ...v, estado: newEstado, status: newStatus } : v
             ));
+
+            // Registrar comprador real (integración Cloy postventa) cuando es venta firme, no cotización.
+            if (!isQuote && combinedClientName) {
+              const dealerUuidForBuyer = userProfile?.supabaseDealerId || userProfile?.dealerId;
+              await supabase.from('compradores').insert([{
+                vehiculo_id: contractData.vehicleId,
+                dealer_id: dealerUuidForBuyer,
+                nombre: combinedClientName,
+                telefono: toE164(data.phone) || null,
+                cedula: data.cedula || null,
+                correo: data.email || null,
+              }]);
+            }
           } catch (updateErr) {
             console.error("Error updating vehicle status:", updateErr);
           }
@@ -8226,6 +10321,9 @@ export default function CarbotApp() {
         .eq('id', vehicleId);
 
       if (error) throw error;
+
+      // 3b. Venta deshecha: el comprador registrado ya no aplica.
+      await supabase.from('compradores').delete().eq('vehiculo_id', vehicleId);
 
       // 4. Update local state
       setInventory(prev => prev.map(v =>
@@ -8371,6 +10469,11 @@ export default function CarbotApp() {
         }}
         className="w-full h-full origin-top flex flex-col"
       >
+        <Suspense fallback={
+          <div className="flex-1 flex items-center justify-center min-h-[60vh]">
+            <Loader2 className="animate-spin" size={32} style={{ color: 'var(--accent, #ef4444)' }} />
+          </div>
+        }>
         {(() => {
           console.log("App: renderContent inner execution", { hasSelectedVehicle: !!selectedVehicle, activeTab });
           if (selectedVehicle) {
@@ -8422,7 +10525,7 @@ export default function CarbotApp() {
             );
           }
           switch (activeTab) {
-            case 'settings': return <SettingsView userProfile={shadowProfile} onLogout={handleLogout} onUpdateProfile={handleUpdateProfile} showToast={showToast} onDisconnectGhl={handleDisconnectGhl} onShowDealerSwitcher={() => setShowDealerSwitcher(true)} isSuperAdmin={isSuperAdmin} />;
+            case 'settings': return <SettingsView userProfile={shadowProfile} onLogout={handleLogout} onUpdateProfile={handleUpdateProfile} showToast={showToast} onDisconnectGhl={handleDisconnectGhl} onShowDealerSwitcher={() => setShowDealerSwitcher(true)} isSuperAdmin={isSuperAdmin} isPlatformAdminUser={isPlatformAdminUser} requestConfirmation={requestConfirmation} onInventoryRecalculated={fetchVehiclesFromSupabase} />;
             case 'dashboard': return <DashboardView inventory={activeInventory} contracts={contracts || []} onNavigate={handleNavigate} userProfile={shadowProfile} />;
             case 'inventory': return <InventoryView inventory={activeInventory} setInventory={setInventory} quotes={quotes || []} contracts={contracts || []} templates={templates} activeTab={inventoryTab} setActiveTab={setInventoryTab} showToast={showToast} onGenerateContract={handleGenerateContract} onGenerateQuote={handleQuoteSent} onVehicleSelect={handleVehicleSelect} onSellQuoted={handleSellQuoted} onSave={handleSaveVehicle}
               onDelete={handleDeleteVehicle}
@@ -8487,6 +10590,7 @@ export default function CarbotApp() {
             default: return <DashboardView inventory={activeInventory} contracts={contracts} onNavigate={handleNavigate} userProfile={shadowProfile} />;
           }
         })()}
+        </Suspense>
       </motion.div>
     );
   };
@@ -8494,7 +10598,13 @@ export default function CarbotApp() {
   // --- RENDER CONDICIONAL DE PANTALLA COMPLETA ---
   // Unificamos pantallas de carga para una experiencia fluida
   // Si estamos loggeados pero no hay profile después de 3s, permitimos que se vea la AppLayout con loaders internos
-  const isActuallyLoading = initializing || ghlSSOLoading || (!authChecked);
+  // Para usuarios logueados (no rutas públicas de tienda) esperamos a tener
+  // el perfil del dealer Y el primer inventario antes de entrar a la app,
+  // evitando el flash de "TU DEALER / Usuario / 0". forceReady es el escape de seguridad.
+  const needsAppData = isLoggedIn && !isStoreRoute;
+  const appDataReady = forceReady || !needsAppData || (!!userProfile && inventoryReady);
+  // No mostrar el loader si el SuperAdmin debe elegir dealer (perfil null a propósito).
+  const isActuallyLoading = (initializing || ghlSSOLoading || (!authChecked) || !appDataReady) && !showDealerSwitcher;
 
   if (isActuallyLoading) {
     return (
@@ -8598,7 +10708,7 @@ export default function CarbotApp() {
     return (
       <>
         <LoginView onLoginSuccess={handleLoginSuccess} />
-        <Toaster position="top-right" />
+        <Toaster position="top-right" theme={isDark ? 'dark' : 'light'} offset={{ top: 20, right: 20 }} options={{ roundness: 16, duration: 3500 }} />
       </>
     );
   }
@@ -8619,97 +10729,7 @@ export default function CarbotApp() {
           {renderContent()}
         </AnimatePresence>
       </AppLayout>
-      <Toaster position="top-right" />
-
-      {/* Modal de bienvenida a notificaciones — aparece una sola vez */}
-      <AnimatePresence>
-        {showNotifWelcome && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            style={{
-              position: 'fixed', inset: 0, zIndex: 9999,
-              background: 'rgba(0,0,0,0.65)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              padding: '24px',
-            }}
-          >
-            <motion.div
-              initial={{ scale: 0.85, opacity: 0, y: 30 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.85, opacity: 0, y: 30 }}
-              transition={{ type: 'spring', damping: 20, stiffness: 280 }}
-              style={{
-                background: '#fff',
-                borderRadius: '24px',
-                padding: '40px 32px 32px',
-                maxWidth: '380px',
-                width: '100%',
-                textAlign: 'center',
-                boxShadow: '0 24px 60px rgba(0,0,0,0.25)',
-                position: 'relative',
-              }}
-            >
-              {/* Ícono campana */}
-              <div style={{
-                width: '72px', height: '72px', borderRadius: '50%',
-                background: 'linear-gradient(135deg, #ef4444, #f97316)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                margin: '0 auto 24px',
-                fontSize: '32px',
-              }}>
-                🔔
-              </div>
-
-              <div style={{
-                fontSize: '11px', fontWeight: 700, letterSpacing: '3px',
-                textTransform: 'uppercase', color: '#ef4444', marginBottom: '8px',
-              }}>
-                Nueva función
-              </div>
-
-              <h2 style={{
-                fontSize: '24px', fontWeight: 800, color: '#0f172a',
-                marginBottom: '14px', lineHeight: 1.2,
-              }}>
-                Notificaciones en tiempo real
-              </h2>
-
-              <p style={{
-                fontSize: '15px', color: '#64748b', lineHeight: 1.6, marginBottom: '28px',
-              }}>
-                Recibe alertas al instante cuando alguien en tu equipo agregue un vehículo, realice una cotización o genere un contrato — directo en tu celular.
-              </p>
-
-              <button
-                onClick={handleNotifWelcomeActivate}
-                style={{
-                  width: '100%', padding: '14px',
-                  background: 'linear-gradient(135deg, #ef4444, #f97316)',
-                  color: '#fff', border: 'none', borderRadius: '12px',
-                  fontSize: '15px', fontWeight: 700, cursor: 'pointer',
-                  marginBottom: '10px',
-                }}
-              >
-                Activar notificaciones
-              </button>
-
-              <button
-                onClick={handleNotifWelcomeDismiss}
-                style={{
-                  width: '100%', padding: '12px',
-                  background: 'transparent', color: '#94a3b8',
-                  border: 'none', borderRadius: '12px',
-                  fontSize: '14px', cursor: 'pointer',
-                }}
-              >
-                Ahora no
-              </button>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <Toaster position="top-right" theme={isDark ? 'dark' : 'light'} offset={{ top: 20, right: 20 }} options={{ roundness: 16, duration: 3500 }} />
 
       {isContractModalOpen && createPortal(
         <GenerateContractModal
@@ -8747,6 +10767,17 @@ export default function CarbotApp() {
         onSoftDelete={handleSoftDeleteDealer}
         onRecover={handleRecoverDealer}
         onCreateDealer={handleCreateDealer}
+        canInstall={isSuperAdmin || hasPanelPermission('install_dealer')}
+        canDelete={isSuperAdmin || hasPanelPermission('delete_dealer')}
+        canEnterAnyAccount={isSuperAdmin || hasPanelPermission('enter_any_account')}
+        canManageAdmins={isSuperAdmin || hasPanelPermission('manage_admins')}
+        platformAdmins={platformAdminsList}
+        ownUserId={platformAdmin?.user_id}
+        onSearchUsers={handleSearchGhlUsers}
+        onAddAdmin={handleAddPlatformAdmin}
+        onUpdateAdmin={handleUpdatePlatformAdmin}
+        onRemoveAdmin={handleRemovePlatformAdmin}
+        showToast={showToast}
       />
     </>
   );

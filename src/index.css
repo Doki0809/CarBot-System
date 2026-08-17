@@ -436,6 +436,32 @@ h1, h2, h3, .font-display {
 ::-webkit-scrollbar { display: none; }
 
 /* ──────────────────────────────────────────────────────────
+   NUMBER INPUTS — hide native spinners (square corners artifact)
+─────────────────────────────────────────────────────────── */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+
+/* ──────────────────────────────────────────────────────────
+   TOASTS (sileo) — color por tipo + alineación del título
+─────────────────────────────────────────────────────────── */
+[data-sileo-title].toast-title-green { color: #15a34a !important; }
+[data-sileo-title].toast-title-white { color: #ffffff !important; }
+[data-sileo-title].toast-title-green,
+[data-sileo-title].toast-title-white {
+  display: flex !important;
+  align-items: center !important;
+  line-height: 1 !important;
+  font-weight: 800 !important;
+}
+/* Badge (ícono): verde más agradable en éxito, blanco en error/aviso */
+[data-sileo-badge].toast-badge-green { --sileo-tone: #15a34a !important; color: #15a34a !important; }
+[data-sileo-badge].toast-badge-white { --sileo-tone: #ffffff !important; color: #ffffff !important; }
+
+/* ──────────────────────────────────────────────────────────
    SMOOTH THEME TRANSITION
 ─────────────────────────────────────────────────────────── */
 *, *::before, *::after {
@@ -698,4 +724,11 @@ button, a, input, select, textarea, [class*="transition-"] {
 .dark .bg-gray-50,
 .dark .bg-gray-100 {
   background-color: var(--bg-tertiary) !important;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }

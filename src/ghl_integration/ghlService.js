@@ -114,6 +114,7 @@ export const prepararPayloadGHL = (cliente, vehiculo, locationId) => {
             { id: "precio", key: "precio", value: formatCurrencyWithText(cliente.precioFinal, cliente.monedaVenta) },
             { id: "inicial", key: "inicial", value: formatCurrencyWithText(cliente.inicial, cliente.monedaInicial) },
             { id: "banco_o_financiera", key: "banco_o_financiera", value: (cliente.banco || "").toUpperCase() },
+            { id: "tiempo_de_garanta", key: "tiempo_de_garanta", value: cliente.tiempoGarantia || "" },
 
             // 5. Otros datos
             { id: "a_quien_va_dirigida", key: "a_quien_va_dirigida", value: `${cliente.nombre || ''} ${cliente.apellido || ''}`.trim().toUpperCase() },
@@ -162,7 +163,10 @@ export const generarContratoEnGHL = async (cliente, vehiculo, locationId, templa
             throw new Error(errorData.error || "Error al comunicar con el backend");
         }
         const data = await response.json();
-        return data.documentUrl;
+        return {
+          documentUrl: data.documentUrl,
+          ghlDocumentId: data.ghlDocumentId || null,
+        };
     } catch (error) {
         console.error("Fallo la integración con GHL:", error);
         throw error;
