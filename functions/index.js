@@ -3,6 +3,7 @@ const { defineSecret } = require("firebase-functions/params");
 const functions = require("firebase-functions");
 const { onDocumentWritten, onDocumentCreated } = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 const { createClient } = require('@supabase/supabase-js');
 
 admin.initializeApp();
@@ -94,7 +95,7 @@ const slugify = (text) => {
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
   if (normalized.includes('DURAN') && normalized.includes('FERNANDEZ')) {
-    return 'dura-n-ferna-ndez-auto-srl';
+    return 'duran-fernandez-auto-srl';
   }
 
   return text
@@ -118,6 +119,82 @@ const capitalize = (val) => {
   return val.charAt(0).toUpperCase() + val.slice(1).toLowerCase();
 };
 
+const CURRENCY_SYMBOLS = { DOP: 'RD$', USD: 'US$', EUR: '€', COP: 'COP$' };
+
+// Construye el link de WhatsApp del dealer. Si el dealer configuró un link
+// completo (wa.me/api.whatsapp.com), se reescribe con el mensaje del vehículo;
+// si es otro tipo de link (ej. invitación de grupo), se usa tal cual.
+const buildWaLink = (dealerPhoneDigits, dealerLinkOverride, message) => {
+  const encoded = encodeURIComponent(message);
+  if (dealerLinkOverride) {
+    const waMeMatch = dealerLinkOverride.match(/(?:wa\.me\/|whatsapp\.com\/send\?phone=)(\d+)/i);
+    if (waMeMatch) return `https://wa.me/${waMeMatch[1]}?text=${encoded}`;
+    return dealerLinkOverride;
+  }
+  if (dealerPhoneDigits) return `https://wa.me/${dealerPhoneDigits}?text=${encoded}`;
+  return null;
+};
+
+// Etiquetas de clasificación para "Link Carbot Simple" — generadas a partir de datos reales
+// del vehículo (tipo_vehiculo, tracción, combustible, motor, asientos, marca), sin inventar valores.
+const PREMIUM_BRANDS = new Set(['BMW', 'MERCEDES-BENZ', 'MERCEDES BENZ', 'MERCEDES', 'AUDI', 'LEXUS', 'PORSCHE', 'LAND ROVER', 'RANGE ROVER', 'JAGUAR', 'VOLVO', 'CADILLAC', 'INFINITI', 'GENESIS', 'MASERATI', 'BENTLEY', 'TESLA']);
+const ECONOMIC_HINT = /corolla|civic|sentra|elantra|versa|accent|rio|yaris|mirage|spark|picanto/;
+
+function inferEtiquetas(v) {
+  const tags = new Set();
+  const tipo = normalizeText(v.tipo_vehiculo || '').trim();
+  const hint = normalizeText(`${v.modelo || ''} ${v.edicion || ''}`);
+
+  if (tipo.includes('jeepeta') || tipo.includes('suv')) {
+    tags.add('suv'); tags.add('jeepeta');
+  } else if (tipo.includes('camioneta') || tipo === 'pickup') {
+    tags.add('pickup'); tags.add('camioneta');
+  } else if (tipo.includes('automovil') || tipo.includes('sedan')) {
+    tags.add('sedán');
+  } else if (tipo.includes('camion') || tipo.includes('truck')) {
+    tags.add('truck'); tags.add('trabajo');
+  } else if (tipo.includes('bus') || tipo.includes('van')) {
+    tags.add('van'); tags.add('comercial');
+  } else if (/suv|jeepeta|rogue|tucson|cr-v|crv|rav4|equinox|trax|cx-5|cx5|santa fe|pilot|highlander|pathfinder|explorer|sorento|telluride|palisade/.test(hint)) {
+    tags.add('suv'); tags.add('jeepeta');
+  } else if (/silverado|f-150|f150|tacoma|tundra|ranger|frontier/.test(hint)) {
+    tags.add('pickup'); tags.add('camioneta');
+  } else if (/civic|corolla|sentra|accord|camry|altima|elantra|sonata|serie 3|serie 5|530e/.test(hint)) {
+    tags.add('sedán');
+  } else if (/hatchback/.test(hint)) {
+    tags.add('hatchback');
+  } else if (/coupe|coupé|convertible/.test(hint)) {
+    tags.add('deportivo');
+  }
+
+  const traccion = normalizeText(v.traccion || '');
+  if (traccion.includes('4x4') || traccion.includes('4wd')) tags.add('4x4');
+  else if (traccion.includes('awd')) tags.add('awd');
+  else if (traccion.includes('fwd')) tags.add('fwd');
+  else if (traccion.includes('rwd')) tags.add('rwd');
+
+  const combustible = normalizeText(v.combustible || '');
+  if (combustible.includes('hibrido')) tags.add('híbrido');
+  else if (combustible.includes('electrico')) tags.add('eléctrico');
+  else if (combustible.includes('diesel')) tags.add('diésel');
+  else if (combustible.includes('gasolina')) tags.add('gasolina');
+  if (normalizeText(v.motor || '').includes('turbo')) tags.add('turbo');
+
+  const seats = parseInt(v.asientos_num) || 0;
+  const isCommercial = tags.has('comercial') || tags.has('trabajo');
+  if (!isCommercial && (seats >= 3 || tags.has('suv'))) tags.add('familiar');
+  if (seats >= 3) tags.add('3 filas');
+
+  const isLujo = PREMIUM_BRANDS.has((v.marca || '').toString().trim().toUpperCase());
+  if (isLujo) tags.add('lujo');
+
+  if (!isLujo && tags.has('sedán') && (tags.has('híbrido') || ECONOMIC_HINT.test(hint))) {
+    tags.add('económico'); tags.add('bajo consumo');
+  }
+
+  return Array.from(tags);
+}
+
 // 1. Función para Inteligencia Artificial (Inventario Dinámico)
 exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
   try {
@@ -128,8 +205,10 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
     // /inventario/:slug/catalogo/:vehicleSlug → Vehicle detail page
     let dealerParam = req.query.dealerID || req.query.dealer || req.query.location_name;
     let autoJsonFormat = req.query.format === 'json';
+    let autoSimpleFormat = req.query.format === 'simple';
     let autoCatalogMode = false;
     let vehicleSlugFromPath = null;
+    let vehicleIdFromPath = null; // /inventario/:slug/vehiculo/:id
 
     const pathParts = (req.path || '').split('/').filter(Boolean);
     if (pathParts.length >= 2 && pathParts[0] === 'inventario') {
@@ -138,12 +217,16 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
         dealerParam = dealerParam || slug;
       }
 
-      // /inventario/:slug/bot → JSON
+      // /inventario/:slug/bot → JSON (especificaciones completas)
       if (pathParts.includes('bot')) {
         autoJsonFormat = true;
       }
+      // /inventario/:slug/carbot-simple → JSON liviano (piloto Duran Fernandez Auto)
+      if (pathParts.includes('carbot-simple')) {
+        autoSimpleFormat = true;
+      }
       // /inventario/:slug/catalogo → Catalog view
-      // /inventario/:slug/catalogo/:vehicleSlug → Vehicle detail
+      // /inventario/:slug/catalogo/:vehicleSlug → Vehicle detail (legacy slug)
       if (pathParts.includes('catalogo')) {
         autoCatalogMode = true;
         const catIdx = pathParts.indexOf('catalogo');
@@ -151,14 +234,30 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
           vehicleSlugFromPath = pathParts[catIdx + 1]; // e.g. "bmw-530e-blanco-2018"
         }
       }
+      // /inventario/:slug/vehiculo/:id → Vehicle detail (new canonical URL)
+      if (pathParts.includes('vehiculo')) {
+        autoCatalogMode = true;
+        const vIdx = pathParts.indexOf('vehiculo');
+        vehicleIdFromPath = pathParts[vIdx + 1] || null;
+      }
     }
 
     // Override query params for downstream use
-    if (autoJsonFormat) req.query.format = 'json';
+    if (autoSimpleFormat) req.query.format = 'simple';
+    else if (autoJsonFormat) req.query.format = 'json';
     if (autoCatalogMode) req.query.view = 'catalog';
 
     if (!dealerParam) {
       return res.status(400).json({ error: "Falta el parámetro 'dealer' o el slug en la URL" });
+    }
+
+    // Alias map: slug variations → canonical dealer ID
+    const DEALER_SLUG_ALIASES = {
+      'duran-fernandez-auto-srl': 'DURÁN FERNÁNDEZ AUTO S.R.L',
+      'dura-n-ferna-ndez-auto-srl': 'DURÁN FERNÁNDEZ AUTO S.R.L',
+    };
+    if (DEALER_SLUG_ALIASES[dealerParam]) {
+      dealerParam = DEALER_SLUG_ALIASES[dealerParam];
     }
 
     console.log(`🤖 IA Request para: ${dealerParam}`);
@@ -227,6 +326,13 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
 
     // --- DEALER LOGO: Pull from Supabase dealers table ---
     let logoUrl = dealerData.logo_url || dealerData.logoUrl || "";
+    let dealerPhone = (dealerData.phone || dealerData.whatsapp || "").replace(/\D/g, '');
+    let dealerWaLink = (dealerData.whatsapp_link || "").trim();
+    // Par de monedas + tasa de cambio manual del dealer (usados por la calculadora
+    // de financiamiento pública). Si no hay tasa manual, se usa una tasa en vivo.
+    let dealerCurrencyPrimary = 'DOP';
+    let dealerCurrencySecondary = 'USD';
+    let dealerManualRate = null;
 
     // 2. Obtener vehículos (Colección primaria: 'vehiculos', Fallback: 'inventario')
     let collectionName = "vehiculos";
@@ -247,10 +353,14 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
       const s = (data.status || data.estado || '').toLowerCase().trim();
       const allowed = ['available', 'disponible', 'quoted', 'cotizado'];
 
-      if (allowed.includes(s) && !data.is_trash) {
+      if (allowed.includes(s) && !data.is_trash && !data._deleted && !data._deleted_at) {
+        const precioCurrency = data.currency || (data.price_dop > 0 ? 'DOP' : 'USD');
+        const inicialCurrency = data.downPaymentCurrency || (data.initial_payment_dop > 0 ? 'DOP' : precioCurrency);
         inventory.push({
           id: doc.id,
           nombre: `${data.year || ""} ${data.make || ""} ${data.model || ""} ${data.edition || ""} ${data.color || ""}`.trim().toUpperCase(),
+          moneda_precio: precioCurrency,
+          moneda_inicial: inicialCurrency,
           precio: (() => {
             const cur = data.currency || (data.price_dop > 0 ? 'DOP' : 'USD');
             const val = Number(data.price || data.price_dop || 0);
@@ -260,6 +370,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
           })(),
           carfax_status: (data.clean_carfax === "Sí" || data.clean_carfax === "Si" || data.clean_carfax === true || data.carfax === "Sí" || data.carfax === "Si") ? "Sí" : (data.clean_carfax === "No" || data.carfax === "No" || data.carfax === false) ? "No" : capitalize(data.clean_carfax || data.carfax),
           mileage_formatted: `${Number(data.mileage || 0).toLocaleString()} ${(["MI", "MILLAS", "MILLA"].includes((data.mileage_unit || data.unit || "").toUpperCase())) ? "Millas" : "Km"}`,
+          link_externo: data.link_externo || null,
           link_catalogo: `https://carbotsystem.com/inventario/${slugify(dealerName)}/catalogo/${vehicleSlugify(data.make, data.model, data.color, data.year)}`,
           link_catalogo_legacy: `https://inventarioia-gzhz2ynksa-uc.a.run.app/catalogo?dealerID=${matchedDealerId}&vehicleID=${doc.id}`,
           // Add color formatted for details
@@ -303,12 +414,18 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
             const mm = { DOP: `RD$ ${ff} Pesos`, USD: `US$ ${ff} Dólares`, EUR: `€ ${ff} Euros`, COP: `COP$ ${ff} Pesos Colombianos` };
             return mm[pCur] || `US$ ${ff} Dólares`;
           })(),
+          inicial_num: (() => {
+            const initVal = Number(data.initial_payment || data.initial_payment_dop || 0);
+            if (initVal > 0) return initVal;
+            return Math.round(Number(data.price || data.price_dop || 0) * 0.2);
+          })(),
           // Fix: Include image for Related Vehicles section
           imagen: (data.images && data.images.length > 0) ? data.images[0] : (data.image || ""),
           has_images: (data.images && data.images.length > 0) || !!data.image,
           // Campos extra
           marca: data.make,
           modelo: data.model,
+          tipo_vehiculo: data.tipo_vehiculo || data.body_style || data.tipo || '',
           edicion: data.edition || data.version,
           anio: data.year,
           anio_num: parseInt(data.year) || 0,
@@ -326,6 +443,8 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
             const parts = [liters, cylinders, turbo].filter(Boolean);
             return parts.length > 0 ? parts.join(", ") : (data.engine || data.motor || "-");
           })(),
+          destacado: !!(data.featured || data.destacado || data.is_featured),
+          fotos_arr: data.images || (data.image ? [data.image] : []),
           condicion: data.condition || data.condicion || 'Usado Importado',
           carfax: data.clean_carfax || data.carfax || "-",
           asientos: data.seats || data.seatRows || "-",
@@ -371,14 +490,22 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
 
     if (dealerUuid) {
       try {
-        // Fetch dealer info from Supabase (logo + nombre fallback)
-        const { data: sbDealer } = await supabase.from('dealers').select('logo_url, nombre').eq('id', dealerUuid).single();
+        // Fetch dealer info from Supabase (logo + nombre + whatsapp fallback)
+        const { data: sbDealer } = await supabase.from('dealers').select('logo_url, nombre, phone, whatsapp_link, moneda_principal, moneda_secundaria, tasa_cambio_manual, tasa_auto_diaria').eq('id', dealerUuid).single();
         if (sbDealer) {
           if (!logoUrl && sbDealer.logo_url) logoUrl = sbDealer.logo_url;
+          if (!dealerPhone && sbDealer.phone) dealerPhone = String(sbDealer.phone).replace(/\D/g, '');
+          if (!dealerWaLink && sbDealer.whatsapp_link) dealerWaLink = String(sbDealer.whatsapp_link).trim();
           // Usar nombre de Supabase si Firestore tiene un nombre genérico o es el ID crudo
           if (sbDealer.nombre && (!dealerName || dealerName === matchedDealerId || dealerName.toLowerCase() === 'mi dealer' || dealerName.toLowerCase() === 'dealer')) {
             dealerName = sbDealer.nombre;
           }
+          dealerCurrencyPrimary = sbDealer.moneda_principal || dealerCurrencyPrimary;
+          dealerCurrencySecondary = sbDealer.moneda_secundaria || dealerCurrencySecondary;
+          // Con la tasa automática diaria activada, la tasa fija se ignora.
+          dealerManualRate = (sbDealer.tasa_auto_diaria !== true && sbDealer.tasa_cambio_manual > 0)
+            ? Number(sbDealer.tasa_cambio_manual)
+            : null;
         }
         console.log(`📡 Consultando Supabase para Dealer UUID: ${dealerUuid}`);
         const { data: supabaseVehicles, error: sbError } = await supabase
@@ -417,7 +544,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
             const s = (v.estado || '').toLowerCase().trim();
             const allowed = ['available', 'disponible', 'quoted', 'cotizado'];
 
-            if (allowed.includes(s) && !v.deleted_at) {
+            if (allowed.includes(s) && !v.deleted_at && !v.is_trash && !v.detalles?._deleted && !v.detalles?._deleted_at && !v.detalles?.is_trash) {
               const isTurbo = (v.detalles?.engine_turbo === "SI" || v.detalles?.turbo === "SI" || v.detalles?.is_turbo === true || v.detalles?.engine_type === "Turbo");
               const turboStr = isTurbo ? "Turbo" : "Aspirado";
 
@@ -425,10 +552,13 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                 id: v.id,
                 is_supabase: true,
                 nombre: `${yearFromTitle} ${makeFromTitle} ${modelFromTitle} ${editionVal} ${(v.color || v.detalles?.color || v.detalles?.exteriorColor || "")}`.trim().toUpperCase(),
+                moneda_precio: currency,
+                moneda_inicial: downPaymentCurrency,
                 precio: priceFormatted,
                 // Carfax: only show "Clean Carfax" if Sí, otherwise empty
                 carfax_status: (v.condicion_carfax === "Sí" || v.condicion_carfax === "Si" || v.condicion_carfax === true || v.detalles?.clean_carfax === "Sí" || v.detalles?.clean_carfax === "Si") ? "Clean Carfax" : "",
                 mileage_formatted: `${Number(v.millas || v.detalles?.mileage || 0).toLocaleString()} ${(["MI", "MILLAS", "MILLA"].includes((v.detalles?.mileage_unit || v.detalles?.unit || "").toUpperCase())) ? "Millas" : "Km"}`,
+                link_externo: v.link_externo || v.detalles?.link_externo || null,
                 link_catalogo: `https://carbotsystem.com/inventario/${slugify(dealerName)}/catalogo/${vehicleSlugify(makeFromTitle, modelFromTitle, v.color || v.detalles?.color || '', yearFromTitle)}`,
                 link_catalogo_legacy: `https://inventarioia-gzhz2ynksa-uc.a.run.app/catalogo?dealerID=${matchedDealerId}&vehicleID=${v.id}&source=supabase`,
 
@@ -471,6 +601,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                 material_fmt: capitalize(v.material_asientos || v.detalles?.seat_material),
                 vin_fmt: (v.chasis_vin || v.detalles?.vin || "").toUpperCase() || "-",
                 inicial_fmt: initialFormatted,
+                inicial_num: initialVal,
 
                 // Metadata & Template compatibility
                 imagen: (v.fotos && v.fotos.length > 0) ? v.fotos[0] : "",
@@ -478,6 +609,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                 marca: makeFromTitle,
                 modelo: modelFromTitle,
                 edicion: editionVal || v.detalles?.version || "-",
+                tipo_vehiculo: v.tipo_vehiculo || v.detalles?.tipo_vehiculo || v.detalles?.body_style || '',
                 anio: yearFromTitle,
                 anio_num: parseInt(yearFromTitle) || 0,
                 color: v.color || v.detalles?.color || v.detalles?.exteriorColor,
@@ -498,6 +630,8 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                   }
                   return [cc, cyl, turboLabel].filter(Boolean).join(", ") || (v.motor || "-");
                 })(),
+                destacado: !!(v.featured || v.destacado || v.detalles?.featured),
+                fotos_arr: (v.fotos && v.fotos.length > 0) ? v.fotos : [],
                 condicion: v.detalles?.condition || v.condicion || 'Usado Importado',
                 carfax: (v.condicion_carfax === "Sí" || v.condicion_carfax === "Si" || v.condicion_carfax === true || v.detalles?.clean_carfax === "Sí" || v.detalles?.clean_carfax === "Si") ? "Clean Carfax" : "",
                 asientos: (() => {
@@ -532,38 +666,87 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
       }
     }
 
-    // ── FORMAT=JSON: Respuesta plana para GHL Bot / Knowledge Base ──
+    // Quita null/undefined/"-"/"N/A"/"0" inválido para no confundir al bot con campos vacíos.
+    const stripEmptyFields = (raw) => {
+      const clean = {};
+      Object.entries(raw).forEach(([k, val]) => {
+        if (val === null || val === undefined) return;
+        const s = String(val).trim();
+        if (!s || s === '-' || s.toUpperCase() === 'N/A' || s === '0') return;
+        clean[k] = val;
+      });
+      return clean;
+    };
+
+    const fotosLine = (v) => v.link_externo
+      ? `Aqui puedes ver las fotos y detalles del carro: ${v.link_externo}`
+      : (v.has_images && v.link_catalogo ? `Aqui puedes ver las fotos y detalles del carro: ${v.link_catalogo}` : "No tengo las fotos en este momento, un compañero te ayudará");
+
+    // ── FORMAT=SIMPLE: "Link Carbot Simple" — JSON puro, solo datos básicos + etiquetas
+    // (sin HTML, sin vista visual) ──
+    if (req.query.format === 'simple') {
+      const sortedForJson = [...inventory].sort((a, b) => (a.marca || "").localeCompare(b.marca || ""));
+      const vehiculos = sortedForJson.map(v => {
+        const clean = stripEmptyFields({
+          marca: v.marca,
+          modelo: v.modelo,
+          año: v.anio_num,
+          edicion: v.edicion,
+          color: v.color_fmt,
+          precio: (v.precio_num > 0) ? v.precio : null,
+          inicial: (v.inicial_num > 0) ? v.inicial_fmt : null,
+        });
+        const etiquetas = inferEtiquetas(v);
+        if (etiquetas.length > 0) clean.etiquetas = etiquetas;
+        return clean;
+      });
+
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+      return res.status(200).json({
+        dealer: dealerName,
+        total: vehiculos.length,
+        vehiculos
+      });
+    }
+
+    // ── FORMAT=JSON: "Bot Carbot" (especificaciones completas) para GHL Bot / Knowledge Base ──
     if (req.query.format === 'json') {
       const dealerSlugForLinks = slugify(dealerName);
       const catalogoUrl = `https://carbotsystem.com/inventario/${dealerSlugForLinks}/catalogo`;
       const sortedForJson = [...inventory].sort((a, b) => (a.marca || "").localeCompare(b.marca || ""));
-      const flatInventory = sortedForJson.map(v => ({
-        marca: v.marca || "-",
-        modelo: v.modelo || "-",
-        año: v.anio_num || 0,
-        color: v.color_fmt || "-",
-        edicion: v.edicion || "-",
-        chasis: v.vin_fmt || "-",
-        precio: v.precio || "-",
-        inicial: v.inicial_fmt || "-",
-        millaje: v.mileage_formatted || "-",
-        transmision: v.transmision_fmt || "-",
-        traccion: v.traccion_fmt || "-",
-        motor: v.motor_fmt || "-",
-        combustible: v.combustible_fmt || "-",
-        carfax: v.carfax_status || "-",
-        techo: v.techo_fmt || "-",
-        llave: v.llave_fmt || "-",
-        baul_electrico: v.baul_fmt || "-",
-        camara: v.camera_fmt || "-",
-        sensores: v.sensores_fmt || "-",
-        carplay: v.carplay_fmt || "-",
-        asientos: v.asientos_fmt || "-",
-        vidrios_electricos: v.vidrios_fmt || "-",
-        material_interior: v.material_fmt || "-",
-        "FOTOS Y DETALLES:": v.has_images && v.link_catalogo ? `Aqui puedes ver las fotos y detalles del carro: ${v.link_catalogo}` : "No tengo las fotos en este momento, un compañero te ayudará",
-        estado: "Disponible"
-      }));
+
+      // Sin chasis/VIN, sin campos vacíos/N/A/0 inválido.
+      const flatInventory = sortedForJson.map(v => {
+        const clean = stripEmptyFields({
+          marca: v.marca,
+          modelo: v.modelo,
+          edicion: v.edicion,
+          año: v.anio_num,
+          color: v.color_fmt,
+          precio: v.precio,
+          inicial: v.inicial_fmt,
+          millaje: v.mileage_formatted,
+          transmision: v.transmision_fmt,
+          traccion: v.traccion_fmt,
+          motor: v.motor_fmt,
+          combustible: v.combustible_fmt,
+          carfax: v.carfax_status,
+          techo: v.techo_fmt,
+          llave: v.llave_fmt,
+          baul_electrico: v.baul_fmt,
+          camara: v.camera_fmt,
+          sensores: v.sensores_fmt,
+          carplay: v.carplay_fmt,
+          asientos: v.asientos_fmt,
+          vidrios_electricos: v.vidrios_fmt,
+          material_interior: v.material_fmt,
+        });
+        clean["FOTOS Y DETALLES:"] = fotosLine(v);
+        clean.estado = "Disponible";
+        return clean;
+      });
 
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -579,7 +762,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
     // 3. Formatear respuesta (JSON por defecto, HTML opcional)
     const isCatalogPath = req.path === '/catalogo' || req.query.view === 'catalog';
     const viewMode = isCatalogPath || req.query.view === 'human' || !req.headers.accept?.includes('application/json');
-    let vehicleId = req.query.vehicleID;
+    let vehicleId = req.query.vehicleID || vehicleIdFromPath;
     // Resolve vehicleSlug from friendly URL path to actual vehicleId
     if (!vehicleId && vehicleSlugFromPath && inventory.length > 0) {
       const matchedVehicle = inventory.find(v => {
@@ -689,10 +872,10 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                       <tr><td class="label">MATERIAL DE ASIENTOS:</td><td class="value">${v.material_fmt}</td></tr>
                     </table>
 
-                    ${v.has_images ? `
+                    ${(v.link_externo || v.has_images) ? `
                       <div class="link-section">
                         <strong>VER FOTOS Y DETALLES:</strong><br/>
-                        <a href="${v.link_catalogo}" class="link-url">${v.link_catalogo}</a>
+                        <a href="${v.link_externo || v.link_catalogo}" class="link-url">${v.link_externo || v.link_catalogo}</a>
                       </div>
                     ` : ''}
                   </div>
@@ -790,6 +973,110 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
         };
 
         const catalogUrl = `https://carbotsystem.com/inventario/${slugify(dealerName)}/catalogo`;
+        const vehicleDetailCanonical = `https://carbotsystem.com/inventario/${slugify(dealerName)}/vehiculo/${vehicleId}`;
+        const vehicleOgImage = photos.length > 0 ? photos[0] : (logoUrl || '');
+        const vehicleOgTitle = `${v.anio || ''} ${v.marca || ''} ${v.modelo || ''} ${v.edicion || ''} | ${dealerName}`.trim();
+        const vehicleOgDesc = `${v.precio || ''} • Inicial: ${v.inicial_calculado || 'Consultar'} • ${v.mileage_formatted || ''} • ${dealerName}`;
+
+        // Imported vs local logic
+        const condicionLower = (v.condicion || '').toLowerCase();
+        const isImported = condicionLower.includes('import') || condicionLower.includes('nuevo') || condicionLower === 'recien importado';
+        const isLocal = condicionLower.includes('local');
+        const hasCleanCarfax = v.carfax === 'Clean Carfax' || v.carfax_status === 'Sí' || v.carfax_status === 'Si';
+
+        // WhatsApp button
+        const waMessageDetail = `Hola, me interesa esta ${[v.anio, v.marca, v.modelo, (v.edicion && v.edicion !== '-') ? v.edicion : '', v.color_fmt || v.color || ''].filter(Boolean).join(' ')}`.replace(/\s+/g, ' ').trim() + `\n${vehicleDetailCanonical}`;
+        const waLinkDetail = buildWaLink(dealerPhone, dealerWaLink, waMessageDetail);
+
+        // --- FINANCIAMIENTO: bancos reales configurados por el dealer ---
+        let financingBanks = [];
+        if (dealerUuid) {
+          try {
+            const { data: banksData, error: banksErr } = await supabase
+              .from('dealer_financing_banks')
+              .select('banco, tasa_anual, max_financiamiento_pct, plazo_maximo_meses')
+              .eq('dealer_id', dealerUuid)
+              .eq('activo', true)
+              .order('orden', { ascending: true });
+            if (banksErr) console.error('❌ Error consultando bancos de financiamiento:', banksErr);
+            financingBanks = banksData || [];
+          } catch (bankErr) {
+            console.error('❌ Fallo consultando bancos de financiamiento:', bankErr);
+          }
+        }
+        const precioNativeVal = v.precio_num || 0;
+        const precioCurrencyCode = v.moneda_precio || 'USD';
+        const inicialNativeVal = (v.inicial_num > 0) ? v.inicial_num : Math.round(precioNativeVal * 0.2);
+        const inicialCurrencyCode = v.moneda_inicial || precioCurrencyCode;
+
+        // "≈ [otra moneda]" chiquito bajo precio e inicial en la ficha del vehículo.
+        // Tasa manual del dealer si la configuró; si no, una sola llamada en vivo.
+        // Todas las monedas se anclan a la PRINCIPAL del dealer:
+        // detailRates[X] = cuántas unidades de la principal vale 1 de X. Así un
+        // precio en una moneda fuera del par configurado también convierte.
+        // Misma semántica que ratesToPrimary en src/utils/exchangeRate.js.
+        const detailRates = { [dealerCurrencyPrimary]: 1 };
+        const inPair = (c) => c === dealerCurrencyPrimary || c === dealerCurrencySecondary;
+        const needsLiveRates = !(dealerManualRate > 0) || !inPair(precioCurrencyCode) || !inPair(inicialCurrencyCode);
+        if (needsLiveRates) try {
+          // Misma fuente que el panel: DOP = promedio de venta de bancos RD.
+          const rateRes = await fetch(`${SUPABASE_URL}/functions/v1/exchange-rate`);
+          const rateData = await rateRes.json();
+          const perUsd = rateData?.perUsd;
+          if (perUsd?.[dealerCurrencyPrimary] > 0) {
+            for (const code of Object.keys(CURRENCY_SYMBOLS)) {
+              if (perUsd[code] > 0) detailRates[code] = perUsd[dealerCurrencyPrimary] / perUsd[code];
+            }
+          }
+        } catch (e) { /* sin red: queda la tasa manual y el respaldo de abajo */ }
+        // La tasa manual del dealer manda sobre su moneda secundaria; el resto
+        // de monedas se quedan con la tasa en vivo.
+        if (dealerManualRate > 0 && dealerCurrencySecondary !== dealerCurrencyPrimary) {
+          detailRates[dealerCurrencySecondary] = Number(dealerManualRate);
+        }
+        detailRates[dealerCurrencyPrimary] = 1;
+        if (!(detailRates[dealerCurrencySecondary] > 0) && dealerCurrencySecondary !== dealerCurrencyPrimary) {
+          detailRates[dealerCurrencySecondary] = 60;
+        }
+
+        const convertToOtherCurrency = (amountNative, fromCur) => {
+          if (!(amountNative > 0) || dealerCurrencyPrimary === dealerCurrencySecondary) return '';
+          // Se muestra en la otra moneda del par; si el precio viene en una
+          // tercera moneda, se muestra en la principal.
+          const toCur = fromCur === dealerCurrencyPrimary ? dealerCurrencySecondary : dealerCurrencyPrimary;
+          const from = detailRates[fromCur], to = detailRates[toCur];
+          if (!(from > 0) || !(to > 0) || fromCur === toCur) return '';
+          const converted = (amountNative * from) / to;
+          return `${CURRENCY_SYMBOLS[toCur] || toCur} ${Math.round(converted).toLocaleString('en-US')}`;
+        };
+        const precioAltDisplay = convertToOtherCurrency(precioNativeVal, precioCurrencyCode);
+        const inicialAltDisplay = (v.inicial_calculado && v.inicial_calculado !== 'N/A') ? convertToOtherCurrency(inicialNativeVal, inicialCurrencyCode) : '';
+        const finBanksJson = JSON.stringify(financingBanks.map(b => ({
+          banco: b.banco,
+          tasa_anual: Number(b.tasa_anual),
+          max_financiamiento_pct: Number(b.max_financiamiento_pct),
+          plazo_maximo_meses: Number(b.plazo_maximo_meses)
+        })));
+
+        // "Cuotas desde": mejor cuota mensual entre los bancos del dealer, usando
+        // el precio/inicial reales y un plazo de 4 años (o el máximo del banco si es menor).
+        let cuotaDesdeText = null;
+        if (financingBanks.length > 0) {
+          const montoBase = Math.max(precioNativeVal - inicialNativeVal, 0);
+          const calcMonthlyPayment = (principal, annualRatePct, months) => {
+            const r = (annualRatePct / 100) / 12;
+            return r > 0 ? (principal * r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1) : (principal / months);
+          };
+          const bestCuota = financingBanks.reduce((min, b) => {
+            const term = Math.min(48, Number(b.plazo_maximo_meses) || 48);
+            const cuota = calcMonthlyPayment(montoBase, Number(b.tasa_anual), term);
+            return cuota < min ? cuota : min;
+          }, Infinity);
+          if (isFinite(bestCuota) && bestCuota > 0) {
+            const symbol = precioCurrencyCode === 'DOP' ? 'RD$' : 'US$';
+            cuotaDesdeText = `${symbol} ${Math.round(bestCuota).toLocaleString()}`;
+          }
+        }
 
         let html = `
           <!DOCTYPE html>
@@ -797,7 +1084,17 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
           <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>${v.nombre} | ${dealerName}</title>
+            <title>${vehicleOgTitle}</title>
+            <!-- Open Graph -->
+            <meta property="og:type" content="product">
+            <meta property="og:url" content="${vehicleDetailCanonical}">
+            <meta property="og:title" content="${vehicleOgTitle}">
+            <meta property="og:description" content="${vehicleOgDesc}">
+            ${vehicleOgImage ? `<meta property="og:image" content="${vehicleOgImage}">` : ''}
+            <meta name="twitter:card" content="summary_large_image">
+            <meta name="twitter:title" content="${vehicleOgTitle}">
+            <meta name="twitter:description" content="${vehicleOgDesc}">
+            ${vehicleOgImage ? `<meta name="twitter:image" content="${vehicleOgImage}">` : ''}
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
             <style>
               :root {
@@ -917,6 +1214,12 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
               .initial-display { display: flex; align-items: baseline; gap: 4px; }
               .initial-sym { font-size: 0.9rem; font-weight: 700; color: var(--text-muted); }
               .initial-val { font-size: 1.3rem; font-weight: 800; color: var(--text-secondary); }
+              .price-alt-line { font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-top: 4px; }
+              .cuota-desde-line { margin-top: 10px; display: inline-flex; align-items: baseline; gap: 6px; cursor: pointer; padding: 6px 10px; margin-left: -10px; border-radius: 10px; transition: background 0.2s; }
+              .cuota-desde-line:hover { background: var(--accent-light); }
+              .cuota-desde-label { font-size: 0.62rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.8px; }
+              .cuota-desde-val { font-size: 0.95rem; font-weight: 900; color: var(--accent); }
+              .cuota-desde-suffix { font-size: 0.68rem; font-weight: 600; color: var(--text-muted); margin-left: 2px; }
 
               /* Quick Specs */
               .quick-specs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
@@ -999,6 +1302,83 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
               .lb-thumb { height: 52px; width: 52px; border-radius: 8px; object-fit: cover; opacity: 0.4; transition: all 0.25s; border: 2px solid transparent; flex-shrink: 0; cursor: pointer; }
               .lb-thumb.active { opacity: 1; border-color: var(--accent); transform: scale(1.06); }
               @media (max-width: 1024px) { .lb-nav { display: none !important; } .lb-img { max-height: 66vh !important; } }
+
+              /* ── FINANCING PANEL ────────────────────── */
+              .fin-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(17,24,39,0.5); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: none; align-items: center; justify-content: center; padding: 24px; }
+              .fin-overlay.show { display: flex; animation: lbIn 0.25s ease; }
+              .fin-panel { background: var(--glass-strong); backdrop-filter: blur(28px) saturate(1.8); -webkit-backdrop-filter: blur(28px) saturate(1.8); border-radius: 32px; max-width: 1080px; width: 100%; max-height: 92vh; overflow-y: auto; padding: 36px 40px 32px; box-shadow: 0 40px 100px rgba(0,0,0,0.35); position: relative; border: 1px solid var(--glass-border); }
+              .fin-panel::-webkit-scrollbar { width: 6px; }
+              .fin-panel::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 10px; }
+              .fin-close { position: absolute; top: 20px; right: 20px; width: 38px; height: 38px; border-radius: 12px; background: rgba(0,0,0,0.04); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-primary); transition: all 0.2s; z-index: 2; }
+              .fin-close:hover { background: rgba(0,0,0,0.08); }
+              .fin-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding-right: 40px; flex-wrap: wrap; }
+              .fin-eyebrow { font-size: 0.62rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; color: var(--accent); margin-bottom: 5px; }
+              .fin-title { font-size: 1.5rem; font-weight: 900; color: var(--text-primary); line-height: 1.15; letter-spacing: -0.5px; }
+              .fin-rate-line { font-size: 0.7rem; font-weight: 600; color: var(--text-muted); margin-top: 6px; }
+              .fin-curr-pill { display: flex; background: rgba(255,255,255,0.4); border: 1px solid rgba(255,255,255,0.5); backdrop-filter: blur(6px); border-radius: 13px; padding: 3px; flex-shrink: 0; }
+              .fin-curr-pill button { border: none; background: none; color: var(--text-secondary); font-size: 0.72rem; font-weight: 800; padding: 8px 16px; border-radius: 10px; cursor: pointer; font-family: inherit; transition: all 0.2s; }
+              .fin-curr-pill button.active { background: var(--accent); color: #fff; }
+
+              .fin-body { display: grid; grid-template-columns: 1.35fr 1fr; gap: 32px; margin-top: 28px; align-items: start; }
+              @media (max-width: 860px) { .fin-body { grid-template-columns: 1fr; gap: 24px; } }
+
+              .fin-amounts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 22px; }
+              .fin-amount-box { background: rgba(255,255,255,0.45); border: 1px solid rgba(255,255,255,0.55); backdrop-filter: blur(6px); border-radius: 18px; padding: 14px 16px; }
+              .fin-amount-label { display: flex; align-items: center; justify-content: space-between; font-size: 0.62rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 8px; }
+              .fin-amount-pct { color: var(--accent); font-weight: 900; }
+              .fin-amount-input-wrap { display: flex; align-items: baseline; gap: 6px; }
+              .fin-amount-sym { font-size: 0.9rem; font-weight: 800; color: var(--text-muted); }
+              .fin-amount-input { background: none; border: none; color: var(--text-primary); font-size: 1.3rem; font-weight: 900; font-family: inherit; width: 100%; padding: 0; outline: none; -moz-appearance: textfield; }
+              .fin-amount-input::-webkit-outer-spin-button, .fin-amount-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+              .fin-section { margin-bottom: 22px; }
+              .fin-section-label { display: flex; align-items: center; justify-content: space-between; font-size: 0.65rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 11px; }
+              .fin-tasa-badge { color: var(--accent); font-weight: 900; font-size: 0.72rem; }
+
+              .fin-banks-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+              .fin-bank-card { text-align: left; background: rgba(255,255,255,0.4); border: 1.5px solid rgba(255,255,255,0.5); backdrop-filter: blur(6px); border-radius: 16px; padding: 14px 16px; cursor: pointer; transition: all 0.2s; font-family: inherit; }
+              .fin-bank-card:hover { border-color: rgba(255,255,255,0.8); background: rgba(255,255,255,0.7); box-shadow: 0 4px 14px rgba(0,0,0,0.06); }
+              .fin-bank-card.active { border-color: var(--accent); background: var(--accent-light); box-shadow: 0 6px 20px rgba(211,47,47,0.15); }
+              .fin-bank-name { font-size: 0.8rem; font-weight: 900; color: var(--text-primary); margin-bottom: 8px; line-height: 1.2; }
+              .fin-bank-rate { font-size: 1.35rem; font-weight: 900; color: var(--accent); line-height: 1; }
+              .fin-bank-rate-suffix { font-size: 0.6rem; font-weight: 700; color: var(--text-muted); margin-left: 3px; }
+              .fin-bank-meta { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+              .fin-bank-meta span { font-size: 0.6rem; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.3px; }
+
+              .fin-pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+              .fin-pill { flex-shrink: 0; background: rgba(255,255,255,0.4); border: 1.5px solid rgba(255,255,255,0.5); backdrop-filter: blur(6px); color: var(--text-secondary); border-radius: 13px; padding: 9px 14px; font-family: inherit; cursor: pointer; transition: all 0.2s; text-align: center; }
+              .fin-pill:hover { background: rgba(255,255,255,0.7); }
+              .fin-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+              .fin-pill-term { display: flex; flex-direction: column; align-items: center; min-width: 56px; line-height: 1.15; }
+              .fin-pill-term-num { font-size: 1.05rem; font-weight: 900; }
+              .fin-pill-term-unit { font-size: 0.56rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.7; }
+
+              .fin-reset-btn { background: none; border: none; color: var(--accent); font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; padding: 2px 0; font-family: inherit; }
+              .fin-warning { margin-top: 14px; display: none; padding: 12px 16px; border-radius: 14px; background: #fff7ed; border: 1px solid #fed7aa; color: #c2410c; font-size: 0.72rem; font-weight: 600; line-height: 1.4; }
+
+              .fin-result-card { border-radius: 24px; padding: 26px 24px; text-align: center; background: linear-gradient(135deg, var(--accent), #8f1616); box-shadow: 0 16px 40px rgba(211,47,47,0.28); position: sticky; top: 0; }
+              .fin-result-label { font-size: 0.62rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; color: rgba(255,255,255,0.8); margin-bottom: 8px; }
+              .fin-result-cuota { font-size: 2.5rem; font-weight: 900; color: #fff; letter-spacing: -1px; }
+              .fin-result-sub { font-size: 0.72rem; font-weight: 700; color: rgba(255,255,255,0.75); margin-top: 5px; }
+              .fin-progress-track { height: 8px; border-radius: 99px; background: rgba(255,255,255,0.22); margin-top: 20px; overflow: hidden; display: flex; }
+              .fin-progress-fill-inicial { height: 100%; background: #10b981; transition: width 0.3s ease; }
+              .fin-progress-fill-financiado { height: 100%; background: rgba(255,255,255,0.9); transition: width 0.3s ease; }
+              .fin-progress-legend { display: flex; justify-content: center; gap: 20px; margin-top: 12px; font-size: 0.68rem; font-weight: 700; color: rgba(255,255,255,0.85); }
+              .fin-progress-legend span { display: flex; align-items: center; gap: 5px; }
+              .fin-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+              .fin-dot-inicial { background: #10b981; }
+              .fin-dot-financiado { background: #fff; }
+              .fin-breakdown-toggle { margin-top: 16px; background: none; border: none; color: rgba(255,255,255,0.85); font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; font-family: inherit; display: inline-flex; align-items: center; gap: 4px; }
+              .fin-breakdown-toggle svg { transition: transform 0.2s; }
+              .fin-breakdown-toggle.open svg { transform: rotate(180deg); }
+              .fin-breakdown { display: none; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.2); grid-template-columns: repeat(3, 1fr); gap: 8px; }
+              .fin-breakdown.show { display: grid; }
+              .fin-breakdown div { font-size: 0.58rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: rgba(255,255,255,0.7); }
+              .fin-breakdown strong { display: block; font-size: 0.85rem; font-weight: 900; color: #fff; margin-top: 4px; text-transform: none; letter-spacing: 0; }
+
+              .fin-empty { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 0.9rem; font-weight: 500; line-height: 1.6; }
+              .fin-wa-cta { margin-top: 16px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; background: #25D366; color: #fff; padding: 14px; border-radius: 16px; font-weight: 800; font-size: 0.85rem; text-decoration: none; box-shadow: 0 6px 18px rgba(37,211,102,0.3); }
+              @media (max-width: 640px) { .fin-panel { padding: 26px 20px 22px; border-radius: 24px; } .fin-title { font-size: 1.2rem; } .fin-result-cuota { font-size: 2rem; } }
             </style>
           </head>
           <body>
@@ -1065,6 +1445,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                     <span class="badge-pill badge-year">${raw.year}</span>
                     <span class="badge-pill badge-meta">${(raw.color || 'N/A').toUpperCase()}</span>
                     ${raw.edition || raw.version ? `<span class="badge-pill badge-meta">${(raw.edition || raw.version).toUpperCase()}</span>` : ''}
+                    ${(raw.tipo_vehiculo || raw.type || raw.body_type || raw.tipo) ? `<span class="badge-pill badge-meta">${(raw.tipo_vehiculo || raw.type || raw.body_type || raw.tipo).toUpperCase()}</span>` : ''}
                   </div>
 
                   <h2 class="vehicle-title">${raw.make}<span class="model-name">${raw.model}</span></h2>
@@ -1081,17 +1462,39 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                       <span class="price-sym">${(v.precio || '').split(' ')[0]}</span>
                       <span class="price-val">${(v.precio || '').substring((v.precio || '').indexOf(' ') + 1)}</span>
                     </div>
+                    ${precioAltDisplay ? `<div class="price-alt-line">≈ ${precioAltDisplay}</div>` : ''}
                   </div>
 
                   <div class="divider"></div>
 
                   <!-- Initial -->
                   <div>
-                    <div class="initial-label">Pago Inicial Sugerido</div>
+                    <div class="initial-label">Pago Inicial</div>
                     <div class="initial-display">
-                      <span class="initial-sym">${(v.inicial_calculado || '').split(' ')[0]}</span>
-                      <span class="initial-val">${(v.inicial_calculado || '').substring((v.inicial_calculado || '').indexOf(' ') + 1)}</span>
+                      <span class="initial-sym">${(v.inicial_calculado && v.inicial_calculado !== 'N/A') ? (v.inicial_calculado || '').split(' ')[0] : ''}</span>
+                      <span class="initial-val">${(v.inicial_calculado && v.inicial_calculado !== 'N/A') ? (v.inicial_calculado || '').substring((v.inicial_calculado || '').indexOf(' ') + 1) : 'Consultar'}</span>
                     </div>
+                    ${inicialAltDisplay ? `<div class="price-alt-line">≈ ${inicialAltDisplay}</div>` : ''}
+                    ${cuotaDesdeText ? `
+                    <div class="cuota-desde-line" onclick="openFinancing()">
+                      <span class="cuota-desde-label">Cuotas desde</span>
+                      <span class="cuota-desde-val">${cuotaDesdeText}<span class="cuota-desde-suffix">/mes</span></span>
+                    </div>
+                    ` : ''}
+                  </div>
+
+                  <div class="divider"></div>
+
+                  <!-- CTA Buttons -->
+                  <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                    ${waLinkDetail ? `<a href="${waLinkDetail}" target="_blank" rel="noopener" style="flex:1;min-width:140px;display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#25D366;color:#fff;padding:14px 20px;border-radius:14px;font-weight:800;font-size:0.85rem;text-decoration:none;transition:all 0.3s;box-shadow:0 4px 12px rgba(37,211,102,0.3);">
+                      <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                      Contacta por WhatsApp
+                    </a>` : ''}
+                    <button type="button" onclick="openFinancing()" style="flex:1;min-width:140px;display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--accent);color:#fff;padding:14px 20px;border-radius:14px;font-weight:800;font-size:0.82rem;border:none;box-shadow:0 4px 12px rgba(211,47,47,0.3);transition:all 0.3s;cursor:pointer;font-family:inherit;">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><rect x="2" y="5" width="20" height="14" rx="2"></rect><line x1="2" y1="10" x2="22" y2="10"></line></svg>
+                      Financíalo
+                    </button>
                   </div>
 
                   <!-- Quick Specs -->
@@ -1173,7 +1576,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                 </div>
                 <div class="related-grid">
                   ${related.map(r => `
-                    <a href="?dealerID=${dealerLinkParam}&vehicleID=${r.id}" class="related-card">
+                    <a href="https://carbotsystem.com/inventario/${slugify(dealerName)}/vehiculo/${r.id}" class="related-card">
                       <div style="overflow:hidden;"><img src="${r.imagen || logoUrl || 'https://via.placeholder.com/400x225?text=Sin+Imagen'}" class="related-card-img" style="${!r.imagen && logoUrl ? 'object-fit:contain;background:#f9fafb;padding:10%;' : ''}"></div>
                       <div class="related-card-body">
                         <h4>${r.nombre}</h4>
@@ -1191,6 +1594,93 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                   Ver Catálogo Completo
                 </a>
                 <div class="footer-tag">Powered by CarBot System</div>
+              </div>
+            </div>
+
+            <!-- FINANCING PANEL -->
+            <div id="finOverlay" class="fin-overlay" onclick="if(event.target===this)closeFinancing()">
+              <div class="fin-panel">
+                <button class="fin-close" onclick="closeFinancing()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
+                ${financingBanks.length > 0 ? `
+                <div class="fin-header">
+                  <div>
+                    <div class="fin-eyebrow">Calculadora de Financiamiento</div>
+                    <div class="fin-title">Simula tu Financiamiento</div>
+                  </div>
+                  <div class="fin-curr-pill">
+                    <button type="button" class="${precioCurrencyCode === dealerCurrencyPrimary ? 'active' : ''}" data-cur="${dealerCurrencyPrimary}" onclick="finSetCurrency('${dealerCurrencyPrimary}')">${CURRENCY_SYMBOLS[dealerCurrencyPrimary] || dealerCurrencyPrimary}</button>
+                    <button type="button" class="${precioCurrencyCode === dealerCurrencyPrimary ? '' : 'active'}" data-cur="${dealerCurrencySecondary}" onclick="finSetCurrency('${dealerCurrencySecondary}')">${CURRENCY_SYMBOLS[dealerCurrencySecondary] || dealerCurrencySecondary}</button>
+                  </div>
+                </div>
+                <div class="fin-rate-line" id="finRateLabel">Cargando tasa de cambio del día…</div>
+
+                <div class="fin-body">
+                  <div class="fin-col-form">
+                    <div class="fin-amounts-row">
+                      <div class="fin-amount-box">
+                        <div class="fin-amount-label">Precio</div>
+                        <div class="fin-amount-input-wrap">
+                          <span class="fin-amount-sym fin-sym">${CURRENCY_SYMBOLS[precioCurrencyCode] || (precioCurrencyCode === 'DOP' ? 'RD$' : 'US$')}</span>
+                          <input type="text" inputmode="numeric" id="finPrecio" class="fin-amount-input">
+                        </div>
+                      </div>
+                      <div class="fin-amount-box">
+                        <div class="fin-amount-label">Inicial <span class="fin-amount-pct" id="finInicialPct">—</span></div>
+                        <div class="fin-amount-input-wrap">
+                          <span class="fin-amount-sym fin-sym">${CURRENCY_SYMBOLS[precioCurrencyCode] || (precioCurrencyCode === 'DOP' ? 'RD$' : 'US$')}</span>
+                          <input type="text" inputmode="numeric" id="finInicial" class="fin-amount-input">
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="fin-section">
+                      <div class="fin-section-label">Banco <span class="fin-tasa-badge" id="finTasaLabel"></span></div>
+                      <div class="fin-banks-grid" id="finBancoPills"></div>
+                    </div>
+
+                    <div class="fin-section">
+                      <div class="fin-section-label">Plazo</div>
+                      <div class="fin-pill-row" id="finPlazoPills"></div>
+                    </div>
+
+                    <button type="button" class="fin-reset-btn" onclick="finResetDefaults()">↺ Restablecer valores del dealer</button>
+                    <div id="finWarning" class="fin-warning"></div>
+                  </div>
+
+                  <div class="fin-col-result">
+                    <div class="fin-result-card">
+                      <div class="fin-result-label">Cuota Mensual Estimada</div>
+                      <div class="fin-result-cuota" id="finCuota">—</div>
+                      <div class="fin-result-sub" id="finResultSub">—</div>
+                      <div class="fin-progress-track">
+                        <div class="fin-progress-fill-inicial" id="finProgressInicial" style="width:0%"></div>
+                        <div class="fin-progress-fill-financiado" id="finProgressFinanciado" style="width:0%"></div>
+                      </div>
+                      <div class="fin-progress-legend">
+                        <span><i class="fin-dot fin-dot-inicial"></i>Inicial <span id="finPctInicial">—</span></span>
+                        <span><i class="fin-dot fin-dot-financiado"></i>Financiado <span id="finPctFinanciado">—</span></span>
+                      </div>
+                      <button type="button" class="fin-breakdown-toggle" id="finBreakdownToggle" onclick="finToggleBreakdown()">
+                        <span id="finBreakdownLabel">Ver desglose</span>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                      </button>
+                      <div class="fin-breakdown" id="finBreakdown">
+                        <div>Financiado<strong id="finMonto">—</strong></div>
+                        <div>Total a Pagar<strong id="finTotal">—</strong></div>
+                        <div>Interés<strong id="finInteres">—</strong></div>
+                      </div>
+                    </div>
+                    ${waLinkDetail ? `<a href="${waLinkDetail}" target="_blank" rel="noopener" class="fin-wa-cta">
+                      <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                      Hablar con un Asesor
+                    </a>` : ''}
+                  </div>
+                </div>
+                ` : `
+                <div class="fin-title" style="margin-bottom:0;padding-right:0;">Simula tu Financiamiento</div>
+                <div class="fin-empty">Estamos preparando opciones de financiamiento para este vehículo.<br>Escríbenos y te ayudamos con las condiciones disponibles.</div>
+                ${waLinkDetail ? `<a href="${waLinkDetail}" target="_blank" rel="noopener" class="fin-wa-cta">Hablar con un Asesor</a>` : ''}
+                `}
               </div>
             </div>
 
@@ -1266,6 +1756,189 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
 
               // Img transition
               var mi=document.getElementById('mainImg');if(mi)mi.style.transition='opacity 0.3s ease';
+
+              // ── FINANCIAMIENTO ──────────────────────
+              var FIN = {
+                precio: ${precioNativeVal},
+                precioCurrency: ${JSON.stringify(precioCurrencyCode)},
+                inicial: ${inicialNativeVal},
+                inicialCurrency: ${JSON.stringify(inicialCurrencyCode)},
+                banks: ${finBanksJson},
+                terms: [6,12,24,36,48,72],
+                primaryCurrency: ${JSON.stringify(dealerCurrencyPrimary)},
+                secondaryCurrency: ${JSON.stringify(dealerCurrencySecondary)},
+                manualRate: ${dealerManualRate != null ? dealerManualRate : 'null'},
+                rates: ${JSON.stringify(detailRates)}
+              };
+              var FIN_CURRENCY_SYMBOLS = { DOP: 'RD$', USD: 'US$', EUR: '€', COP: 'COP$' };
+              // 1 unidad de secondaryCurrency = finRate unidades de primaryCurrency.
+              // Si el dealer configuró una tasa manual, esa manda; si no, se reemplaza
+              // con la tasa en vivo al cargar (ver fetch más abajo). 60 es solo respaldo.
+              var finRate = FIN.rates[FIN.secondaryCurrency] || 60;
+              var finCurrency = FIN.precioCurrency === FIN.secondaryCurrency ? FIN.secondaryCurrency : FIN.primaryCurrency;
+              var finBankIdx = 0;
+              var finPlazo = 48;
+
+              function finConvert(amount, fromCur, toCur) {
+                if (fromCur === toCur) return amount;
+                var from = FIN.rates[fromCur], to = FIN.rates[toCur];
+                if (!(from > 0) || !(to > 0)) return amount;
+                return amount * from / to;
+              }
+              function finFmt(n) { return Math.round(n).toLocaleString('en-US'); }
+              function finSymbol(cur) { return FIN_CURRENCY_SYMBOLS[cur] || cur; }
+
+              function finPopulateBanks() {
+                var wrap = document.getElementById('finBancoPills');
+                if (!wrap) return;
+                wrap.innerHTML = FIN.banks.map(function(b, i) {
+                  return '<button type="button" class="fin-bank-card' + (i === finBankIdx ? ' active' : '') + '" data-idx="' + i + '" onclick="finSelectBank(' + i + ')">' +
+                    '<div class="fin-bank-name">' + b.banco + '</div>' +
+                    '<div class="fin-bank-rate">' + b.tasa_anual + '<span class="fin-bank-rate-suffix">% ANUAL</span></div>' +
+                    '<div class="fin-bank-meta"><span>Hasta ' + b.max_financiamiento_pct + '% financiado</span><span>Plazo máx. ' + b.plazo_maximo_meses + ' meses</span></div>' +
+                    '</button>';
+                }).join('');
+                var tasaLabel = document.getElementById('finTasaLabel');
+                if (tasaLabel && FIN.banks[finBankIdx]) tasaLabel.textContent = FIN.banks[finBankIdx].tasa_anual + '% anual';
+              }
+              function finSelectBank(i) {
+                finBankIdx = i;
+                document.querySelectorAll('#finBancoPills .fin-bank-card').forEach(function(el) { el.classList.toggle('active', parseInt(el.dataset.idx, 10) === i); });
+                var tasaLabel = document.getElementById('finTasaLabel');
+                if (tasaLabel) tasaLabel.textContent = FIN.banks[i].tasa_anual + '% anual';
+                finPopulatePlazos();
+                finCalculate();
+              }
+              function finPopulatePlazos() {
+                var wrap = document.getElementById('finPlazoPills');
+                var bank = FIN.banks[finBankIdx];
+                if (!wrap || !bank) return;
+                var maxMeses = bank.plazo_maximo_meses;
+                var opts = FIN.terms.filter(function(m) { return m <= maxMeses; });
+                if (opts.indexOf(maxMeses) === -1) opts.push(maxMeses);
+                if (opts.indexOf(finPlazo) === -1) {
+                  // Default a un plazo típico de 4 años; si el banco no lo permite, el más largo disponible.
+                  finPlazo = opts.indexOf(48) !== -1 ? 48 : opts[opts.length - 1];
+                }
+                wrap.innerHTML = opts.map(function(m) {
+                  var num = (m % 12 === 0) ? (m / 12) : m;
+                  var unit = (m % 12 === 0) ? (m / 12 === 1 ? 'AÑO' : 'AÑOS') : 'MESES';
+                  return '<button type="button" class="fin-pill fin-pill-term' + (m === finPlazo ? ' active' : '') + '" data-val="' + m + '" onclick="finSelectPlazo(' + m + ')"><span class="fin-pill-term-num">' + num + '</span><span class="fin-pill-term-unit">' + unit + '</span></button>';
+                }).join('');
+              }
+              function finSelectPlazo(m) {
+                finPlazo = m;
+                document.querySelectorAll('#finPlazoPills .fin-pill').forEach(function(el) { el.classList.toggle('active', parseInt(el.dataset.val, 10) === m); });
+                finCalculate();
+              }
+              function finParseNum(str) { return parseFloat(String(str || '').replace(/,/g, '')) || 0; }
+              function finSetInputValue(id, num) { document.getElementById(id).value = Math.round(num).toLocaleString('en-US'); }
+              function finFormatInputLive(e) {
+                var el = e.target;
+                var digits = el.value.replace(/[^0-9]/g, '');
+                el.value = digits ? Number(digits).toLocaleString('en-US') : '';
+              }
+              function finSetCurrency(cur) {
+                if (cur === finCurrency) return;
+                var precioInput = document.getElementById('finPrecio');
+                var inicialInput = document.getElementById('finInicial');
+                finSetInputValue('finPrecio', finConvert(finParseNum(precioInput.value), finCurrency, cur));
+                finSetInputValue('finInicial', finConvert(finParseNum(inicialInput.value), finCurrency, cur));
+                finCurrency = cur;
+                document.querySelectorAll('.fin-curr-pill button').forEach(function(b) { b.classList.toggle('active', b.dataset.cur === cur); });
+                document.querySelectorAll('.fin-sym').forEach(function(s) { s.textContent = finSymbol(cur); });
+                finCalculate();
+              }
+              function finResetDefaults() {
+                finSetInputValue('finPrecio', finConvert(FIN.precio, FIN.precioCurrency, finCurrency));
+                finSetInputValue('finInicial', finConvert(FIN.inicial, FIN.inicialCurrency, finCurrency));
+                finCalculate();
+              }
+              function finToggleBreakdown() {
+                var el = document.getElementById('finBreakdown');
+                var btn = document.getElementById('finBreakdownToggle');
+                var isOpen = el.classList.toggle('show');
+                btn.classList.toggle('open', isOpen);
+                document.getElementById('finBreakdownLabel').textContent = isOpen ? 'Ocultar desglose' : 'Ver desglose';
+              }
+              function finCalculate() {
+                if (!FIN.banks.length) return;
+                var precio = finParseNum(document.getElementById('finPrecio').value);
+                var inicial = finParseNum(document.getElementById('finInicial').value);
+                var bank = FIN.banks[finBankIdx];
+                var plazo = finPlazo || 1;
+                if (!bank) return;
+
+                var monto = Math.max(precio - inicial, 0);
+                var r = (bank.tasa_anual / 100) / 12;
+                var cuota = r > 0 ? (monto * r * Math.pow(1 + r, plazo)) / (Math.pow(1 + r, plazo) - 1) : (monto / plazo);
+                var totalPagar = cuota * plazo;
+                var totalInteres = totalPagar - monto;
+
+                document.getElementById('finCuota').textContent = finSymbol(finCurrency) + ' ' + finFmt(cuota);
+                document.getElementById('finResultSub').textContent = plazo + ' meses · ' + bank.tasa_anual + '% anual';
+                document.getElementById('finMonto').textContent = finSymbol(finCurrency) + ' ' + finFmt(monto);
+                document.getElementById('finTotal').textContent = finSymbol(finCurrency) + ' ' + finFmt(totalPagar);
+                document.getElementById('finInteres').textContent = finSymbol(finCurrency) + ' ' + finFmt(totalInteres);
+
+                var pctInicial = precio > 0 ? Math.min((inicial / precio) * 100, 100) : 0;
+                var pctFinanciado = Math.max(100 - pctInicial, 0);
+                document.getElementById('finInicialPct').textContent = pctInicial.toFixed(0) + '%';
+                document.getElementById('finPctInicial').textContent = pctInicial.toFixed(0) + '%';
+                document.getElementById('finPctFinanciado').textContent = pctFinanciado.toFixed(0) + '%';
+                document.getElementById('finProgressInicial').style.width = pctInicial + '%';
+                document.getElementById('finProgressFinanciado').style.width = pctFinanciado + '%';
+
+                var pctFinanciadoReal = precio > 0 ? (monto / precio) * 100 : 0;
+                var warnEl = document.getElementById('finWarning');
+                if (pctFinanciadoReal > bank.max_financiamiento_pct + 0.01) {
+                  warnEl.style.display = 'block';
+                  warnEl.textContent = 'Este banco financia hasta ' + bank.max_financiamiento_pct + '% del precio. Con este inicial estás pidiendo ' + pctFinanciadoReal.toFixed(1) + '%. Aumenta el inicial o consulta condiciones especiales con el asesor.';
+                } else {
+                  warnEl.style.display = 'none';
+                }
+              }
+              function openFinancing() {
+                document.getElementById('finOverlay').classList.add('show');
+                document.body.style.overflow = 'hidden';
+              }
+              function closeFinancing() {
+                document.getElementById('finOverlay').classList.remove('show');
+                document.body.style.overflow = '';
+              }
+
+              if (FIN.banks.length > 0) {
+                finPopulateBanks();
+                finPopulatePlazos();
+                finResetDefaults();
+                document.getElementById('finPrecio').addEventListener('input', function(e) { finFormatInputLive(e); finCalculate(); });
+                document.getElementById('finInicial').addEventListener('input', function(e) { finFormatInputLive(e); finCalculate(); });
+
+                if (FIN.manualRate) {
+                  var manualRateLabel = document.getElementById('finRateLabel');
+                  if (manualRateLabel) manualRateLabel.textContent = 'Tasa: 1 ' + finSymbol(FIN.secondaryCurrency) + ' = ' + finSymbol(FIN.primaryCurrency) + finRate.toFixed(2);
+                } else {
+                  fetch(${JSON.stringify(SUPABASE_URL + '/functions/v1/exchange-rate')})
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                      var perUsd = data && data.perUsd;
+                      if (perUsd && perUsd[FIN.primaryCurrency] > 0) {
+                        for (var code in FIN_CURRENCY_SYMBOLS) {
+                          if (perUsd[code] > 0) FIN.rates[code] = perUsd[FIN.primaryCurrency] / perUsd[code];
+                        }
+                        FIN.rates[FIN.primaryCurrency] = 1;
+                        finRate = FIN.rates[FIN.secondaryCurrency];
+                        var rateLabel = document.getElementById('finRateLabel');
+                        if (rateLabel && finRate > 0) rateLabel.textContent = 'Tasa de hoy: 1 ' + finSymbol(FIN.secondaryCurrency) + ' = ' + finSymbol(FIN.primaryCurrency) + finRate.toFixed(2);
+                      }
+                    })
+                    .catch(function() { /* se mantiene la tasa de respaldo */ });
+                }
+              }
+
+              document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') { var fo = document.getElementById('finOverlay'); if (fo && fo.classList.contains('show')) closeFinancing(); }
+              });
             </script>
           </body>
           </html>
@@ -1278,12 +1951,19 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
       }
 
       console.log(`👉 [inventarioIA] Pasando a MODO LISTA (REDISEÑO TIENDA PREMIUM)`);
-      const grouped = inventory.reduce((acc, v) => {
-        const marca = (v.marca || 'Otras').toUpperCase();
-        if (!acc[marca]) acc[marca] = [];
-        acc[marca].push(v);
-        return acc;
-      }, {});
+
+      // Catalog: only vehicles with price > 0
+      const catalogInventory = inventory.filter(v => v.precio_num > 0);
+      // Sort: destacados → más recientes → más económicos
+      catalogInventory.sort((a, b) => {
+        if (b.destacado !== a.destacado) return (b.destacado ? 1 : 0) - (a.destacado ? 1 : 0);
+        if (b.anio_num !== a.anio_num) return b.anio_num - a.anio_num;
+        return a.precio_num - b.precio_num;
+      });
+
+      const dealerSlugForCatalog = slugify(dealerName);
+      const catalogPageUrl = `https://carbotsystem.com/inventario/${dealerSlugForCatalog}/catalogo`;
+      const ogImage = logoUrl || 'https://carbotsystem.com/og-default.png';
 
       let html = `
         <!DOCTYPE html>
@@ -1291,7 +1971,17 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
         <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Inventario | ${dealerName}</title>
+          <title>${dealerName} | Inventario Disponible</title>
+          <!-- Open Graph -->
+          <meta property="og:type" content="website">
+          <meta property="og:url" content="${catalogPageUrl}">
+          <meta property="og:title" content="${dealerName} | Inventario Disponible">
+          <meta property="og:description" content="Explora nuestro inventario actualizado de vehículos disponibles con financiamiento y garantía.">
+          <meta property="og:image" content="${ogImage}">
+          <meta name="twitter:card" content="summary_large_image">
+          <meta name="twitter:title" content="${dealerName} | Inventario Disponible">
+          <meta name="twitter:description" content="Explora nuestro inventario actualizado de vehículos disponibles con financiamiento y garantía.">
+          <meta name="twitter:image" content="${ogImage}">
           <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800;900&family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
           <style>
             :root { 
@@ -1555,28 +2245,33 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
             @media (min-width: 640px) { .inventory-grid { grid-template-columns: repeat(2, 1fr); } }
             @media (min-width: 1024px) { .inventory-grid { grid-template-columns: repeat(3, 1fr); } }
             
-            .vehicle-card { background: #fff; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e8ecf1; transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; cursor: pointer; text-decoration: none; color: inherit; position: relative; }
+            .vehicle-card { background: #fff; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e8ecf1; transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; position: relative; }
             .vehicle-card:hover { transform: translateY(-8px) scale(1.01); box-shadow: 0 20px 40px rgba(0,0,0,0.12), 0 4px 10px rgba(0,0,0,0.06); border-color: #d1d5db; }
+            .card-img-link { text-decoration: none; color: inherit; display: flex; flex-direction: column; flex: 1; }
+            .card-badge-featured { position: absolute; top: 12px; left: 12px; background: var(--primary); color: #fff; font-size: 0.65rem; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; padding: 4px 10px; border-radius: 999px; }
+            .card-actions { display: flex; gap: 8px; padding: 0 20px 20px; margin-top: auto; }
+            .btn-wa { display: inline-flex; align-items: center; gap: 6px; background: #25D366; color: #fff; padding: 12px 14px; border-radius: 14px; font-weight: 700; font-size: 0.78rem; text-decoration: none; transition: all 0.3s; white-space: nowrap; }
+            .btn-wa:hover { background: #1ebe5c; transform: translateY(-2px); }
             
             .card-img-container { width: 100%; aspect-ratio: 4/3; background: #eee; position: relative; overflow: hidden; }
             .card-img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.8s cubic-bezier(0.4, 0, 0.2, 1); }
             .vehicle-card:hover .card-img { transform: scale(1.1); }
             
-            .card-body { padding: 28px; flex: 1; display: flex; flex-direction: column; }
-            .card-tag { font-family: 'Outfit', sans-serif; font-size: 0.75rem; font-weight: 800; color: var(--primary); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
-            .card-title { font-size: 1.4rem; font-weight: 800; color: #1e293b; text-transform: uppercase; line-height: 1.1; margin-bottom: 15px; height: 3.1rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; letter-spacing: -0.5px; }
-            
+            .card-body { padding: 20px 20px 12px; flex: 1; display: flex; flex-direction: column; }
+            .card-tag { font-family: 'Outfit', sans-serif; font-size: 0.75rem; font-weight: 800; color: var(--primary); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 6px; min-height: 1.1em; }
+            .card-title { font-size: 1.4rem; font-weight: 800; color: #1e293b; text-transform: uppercase; line-height: 1.1; margin-bottom: 10px; height: 3.1rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; letter-spacing: -0.5px; }
+
             .card-price-row { display: flex; align-items: baseline; gap: 8px; margin-top: auto; }
             .card-price { font-size: 1.7rem; font-weight: 900; color: #1e293b; font-family: 'Outfit'; letter-spacing: -1px; }
             .card-currency { font-size: 1rem; font-weight: 800; color: var(--primary); text-transform: uppercase; }
             .card-dp { font-size: 0.95rem; font-weight: 600; color: var(--secondary); margin-top: 2px; }
-            
-            .card-specs { display: flex; gap: 20px; margin: 20px 0; padding-top: 20px; border-top: 1px solid #f1f5f9; }
+
+            .card-specs { display: flex; gap: 20px; margin: 14px 0; padding-top: 14px; border-top: 1px solid #f1f5f9; }
             .mini-spec { font-size: 0.8rem; font-weight: 600; color: var(--secondary); display: flex; align-items: center; gap: 6px; }
             .mini-spec svg { opacity: 0.7; width: 14px; height: 14px; }
             
-            .btn-view { margin-top: 25px; padding: 16px; background: #1e293b; color: #fff; text-align: center; border-radius: 18px; font-weight: 800; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 2px; transition: all 0.3s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            .vehicle-card:hover .btn-view { background: var(--primary); transform: scale(1.02); box-shadow: 0 10px 15px rgba(239, 68, 68, 0.3); }
+            .btn-view { flex: 1; padding: 12px 16px; background: #1e293b; color: #fff; text-align: center; border-radius: 14px; font-weight: 800; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 1.5px; transition: all 0.3s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-decoration: none; display: flex; align-items: center; justify-content: center; }
+            .vehicle-card:hover .btn-view { background: var(--primary); box-shadow: 0 10px 15px rgba(239, 68, 68, 0.3); }
             
             .no-results { text-align: center; padding: 120px 20px; display: none; }
             .no-results h3 { font-family: 'Outfit'; font-size: 2rem; color: #cbd5e1; font-weight: 900; text-transform: uppercase; letter-spacing: 2px; }
@@ -1613,7 +2308,7 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                       </div>
                       <div class="options-list">
                         <div class="option" onclick="selectOption('brandSelect', '', 'Marca')">Marca</div>
-                        ${Object.keys(grouped).sort().map(b => `<div class="option" onclick="selectOption('brandSelect', '${b}', '${b}')">${b}</div>`).join('')}
+                        ${[...new Set(catalogInventory.map(v => (v.marca || '').toUpperCase()).filter(Boolean))].sort().map(b => `<div class="option" onclick="selectOption('brandSelect', '${b}', '${b}')">${b}</div>`).join('')}
                       </div>
                     </div>
                   </div>
@@ -1732,42 +2427,57 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
           
           <div class="container">
             <div class="results-info">
-               <span id="resultsCount">${inventory.length}</span> Unidades en stock
+               <span id="resultsCount">${catalogInventory.length}</span> Unidades en stock
             </div>
-            
+
             <div id="inventoryGrid" class="inventory-grid">
-              ${inventory.sort((a, b) => b.anio_num - a.anio_num).map((v, idx) => `
-                <a href="?dealer=${req.query.dealer || matchedDealerId}&vehicleID=${v.id}" class="vehicle-card" 
+              ${catalogInventory.map((v, idx) => {
+                const vehicleDetailUrl = `https://carbotsystem.com/inventario/${dealerSlugForCatalog}/vehiculo/${v.id}`;
+                const mileageDisplay = Number(v.mileage) > 0
+                  ? `${Number(v.mileage).toLocaleString()} ${v.unit || 'Km'}`
+                  : 'Consultar';
+                const inicialDisplay = (v.inicial_calculado && v.inicial_calculado !== 'N/A')
+                  ? v.inicial_calculado.replace('INICIAL: ', '')
+                  : 'Consultar';
+                const waMsg = dealerPhone
+                  ? `https://wa.me/${dealerPhone}?text=${encodeURIComponent(`Hola, me interesa el vehículo:\n${v.anio || ''} ${v.marca || ''} ${v.modelo || ''} ${v.edicion || ''}\nque vi en el catálogo de ${dealerName}.\n¿Podrían brindarme más información?`)}`
+                  : null;
+                const cardTagParts = [
+                  v.anio || '',
+                  (v.edicion && v.edicion !== '-') ? v.edicion : '',
+                  (v.color && v.color !== '-') ? v.color : '',
+                  (v.tipo_vehiculo && v.tipo_vehiculo !== '-') ? v.tipo_vehiculo : '',
+                ].filter(Boolean);
+                return `
+                <div class="vehicle-card"
                    style="animation: fadeIn 0.6s ease-out forwards; animation-delay: ${idx * 0.05}s"
-                   data-brand="${(v.marca || '').toUpperCase()}" 
+                   data-brand="${(v.marca || '').toUpperCase()}"
                    data-model="${(v.modelo || '').toUpperCase()}"
-                   data-year="${v.anio_num}" 
+                   data-year="${v.anio_num}"
                    data-price="${v.precio_num}"
                    data-price-ref="${v.precio_dop_ref}"
                    data-seats="${v.asientos_num}"
                    data-traction="${(v.traccion || '').toUpperCase()}"
                    data-text="${v.nombre.toLowerCase()}">
+                  <a href="${vehicleDetailUrl}" class="card-img-link">
                   <div class="card-img-container">
                     ${v.imagen
-          ? `<img src="${v.imagen}" class="card-img">`
-          : `<img src="${logoUrl || 'https://via.placeholder.com/600x450?text=CarBot'}" class="card-img" style="object-fit:contain;background:#f8fafc;padding:12%;">`}
+                      ? `<img src="${v.imagen}" class="card-img" loading="lazy">`
+                      : `<img src="${logoUrl || 'https://via.placeholder.com/600x450?text=Sin+Foto'}" class="card-img" style="object-fit:contain;background:#f8fafc;padding:12%;" loading="lazy">`}
+                    ${v.destacado ? '<div class="card-badge-featured">Destacado</div>' : ''}
                   </div>
                   <div class="card-body">
-                    <div class="card-tag">${v.anio || ''} • ${v.color || ''} • ${v.edicion || ''}</div>
+                    <div class="card-tag">${cardTagParts.join(' • ')}</div>
                     <div class="card-title">${v.marca || ''} ${v.modelo || ''}</div>
-                    
+
                     <div class="card-specs">
                       <div class="mini-spec">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
                         ${(v.transmision || '-').split(' ')[0]}
                       </div>
                       <div class="mini-spec">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M12 2v4"></path><path d="M12 18v4"></path></svg>
-                        ${v.motor || '-'}
-                      </div>
-                      <div class="mini-spec">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.77 3.77z"></path></svg>
-                        ${v.traccion || 'FWD'}
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a7 7 0 1 0 0 14A7 7 0 0 0 12 2zm0 0v2m0 10v2m10-7h-2M4 12H2"/></svg>
+                        ${mileageDisplay}
                       </div>
                     </div>
 
@@ -1775,12 +2485,18 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                       <span class="card-currency">${v.precio.split(' ')[0]}</span>
                       <span class="card-price">${v.precio.split(' ')[1] || v.precio}</span>
                     </div>
-                    <div class="card-dp">Inicial ${v.inicial_calculado.replace('INICIAL: ', '')}</div>
-                    
-                    <div class="btn-view">Explorar Detalles</div>
+                    <div class="card-dp">Inicial: ${inicialDisplay}</div>
                   </div>
-                </a>
-              `).join('')}
+                  </a>
+                  <div class="card-actions">
+                    <a href="${vehicleDetailUrl}" class="btn-view">Ver Detalles</a>
+                    ${waMsg ? `<a href="${waMsg}" target="_blank" class="btn-wa" rel="noopener">
+                      <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z"/></svg>
+                      WhatsApp
+                    </a>` : ''}
+                  </div>
+                </div>`;
+              }).join('')}
             </div>
             
             <div id="noResults" class="no-results">
@@ -2028,6 +2744,140 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
   } catch (error) {
     console.error("❌ Error en inventarioIA:", error);
     return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────
+// inventorySearch — integración Cloy (soporte postventa)
+// POST /inventorySearch  { dealer_id, filtros? }
+// Header: Authorization: Bearer <cloy_api_key del dealer>
+// Devuelve { total, vehiculos }. Si un vehículo está "Vendido", incluye
+// comprador { nombre, telefono, cedula, correo, fecha_venta }.
+// ──────────────────────────────────────────────────────────────────
+function timingSafeEqualStr(a, b) {
+  const bufA = crypto.createHash('sha256').update(String(a || '')).digest();
+  const bufB = crypto.createHash('sha256').update(String(b || '')).digest();
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function toE164(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (s.startsWith('+')) return s;
+  const digits = s.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return digits ? `+${digits}` : null;
+}
+
+exports.inventorySearch = onRequest({ cors: true, secrets: [supabaseServiceKey] }, async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).send('');
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+  }
+
+  try {
+    const authHeader = req.headers.authorization || '';
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    const bearerToken = match ? match[1].trim() : null;
+
+    const dealerId = req.body?.dealer_id;
+    if (!dealerId) {
+      return res.status(400).json({ error: "Falta 'dealer_id' en el body." });
+    }
+    if (!bearerToken) {
+      return res.status(401).json({ error: 'Falta Authorization: Bearer <api_key>.' });
+    }
+
+    const supabaseAdmin = createClient(SUPABASE_URL, supabaseServiceKey.value());
+
+    const { data: keyRow, error: keyErr } = await supabaseAdmin
+      .from('dealer_api_keys')
+      .select('cloy_api_key')
+      .eq('dealer_id', dealerId)
+      .maybeSingle();
+
+    if (keyErr || !keyRow || !timingSafeEqualStr(bearerToken, keyRow.cloy_api_key)) {
+      return res.status(401).json({ error: 'API key inválida para este dealer_id.' });
+    }
+
+    const filtros = req.body?.filtros || {};
+
+    let query = supabaseAdmin
+      .from('vehiculos')
+      .select('*')
+      .eq('dealer_id', dealerId)
+      .is('deleted_at', null);
+
+    if (filtros.id) query = query.eq('id', filtros.id);
+    if (filtros.chasis_vin) query = query.ilike('chasis_vin', filtros.chasis_vin);
+    if (filtros.marca) query = query.ilike('marca', `%${filtros.marca}%`);
+    if (filtros.modelo) query = query.ilike('modelo', `%${filtros.modelo}%`);
+    if (filtros.estado) query = query.eq('estado', filtros.estado);
+
+    // Búsqueda por identidad del comprador (caso de uso principal: soporte postventa
+    // recibe teléfono/cédula del cliente y necesita ubicar su vehículo).
+    if (filtros.telefono || filtros.cedula || filtros.correo) {
+      let buyerQuery = supabaseAdmin.from('compradores').select('vehiculo_id').eq('dealer_id', dealerId);
+      if (filtros.telefono) buyerQuery = buyerQuery.eq('telefono', toE164(filtros.telefono));
+      if (filtros.cedula) buyerQuery = buyerQuery.eq('cedula', filtros.cedula);
+      if (filtros.correo) buyerQuery = buyerQuery.ilike('correo', filtros.correo);
+
+      const { data: buyerRows, error: buyerErr } = await buyerQuery;
+      if (buyerErr) throw buyerErr;
+
+      const vehicleIds = [...new Set((buyerRows || []).map(r => r.vehiculo_id))];
+      if (vehicleIds.length === 0) {
+        return res.status(200).json({ total: 0, vehiculos: [] });
+      }
+      query = query.in('id', vehicleIds);
+    }
+
+    const { data: vehiculos, error: vErr } = await query;
+    if (vErr) throw vErr;
+
+    if (!vehiculos || vehiculos.length === 0) {
+      return res.status(200).json({ total: 0, vehiculos: [] });
+    }
+
+    // Traer compradores solo para los vendidos de este batch (evita queries de más).
+    const soldIds = vehiculos.filter(v => v.estado === 'Vendido').map(v => v.id);
+    let buyersByVehicle = new Map();
+    if (soldIds.length > 0) {
+      const { data: buyers, error: bErr } = await supabaseAdmin
+        .from('compradores')
+        .select('vehiculo_id, nombre, telefono, cedula, correo, fecha_venta')
+        .in('vehiculo_id', soldIds)
+        .order('fecha_venta', { ascending: false });
+      if (bErr) throw bErr;
+      (buyers || []).forEach(b => {
+        if (!buyersByVehicle.has(b.vehiculo_id)) buyersByVehicle.set(b.vehiculo_id, b);
+      });
+    }
+
+    const result = vehiculos.map(v => {
+      const out = { ...v };
+      delete out.deleted_at;
+      if (v.estado === 'Vendido' && buyersByVehicle.has(v.id)) {
+        const b = buyersByVehicle.get(v.id);
+        out.comprador = {
+          nombre: b.nombre,
+          telefono: b.telefono || null,
+          cedula: b.cedula || null,
+          correo: b.correo || null,
+          fecha_venta: b.fecha_venta,
+        };
+      }
+      return out;
+    });
+
+    return res.status(200).json({ total: result.length, vehiculos: result });
+  } catch (error) {
+    console.error('❌ Error en inventorySearch:', error);
+    return res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
 
@@ -2550,7 +3400,86 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
   }
 
   try {
-    const { contactData, templateId, ghl_access_token, vehicleData, financialData, documentType, dealerId: bodyDealerId } = req.body;
+    const { mode, contactData, templateId, ghl_access_token, vehicleData, financialData, documentType, dealerId: bodyDealerId } = req.body;
+
+    // ── MODO LIMPIEZA MASIVA (TEMPORAL) ──────────────────────────────────────
+    if (mode === 'cleanup' && bodyDealerId) {
+      console.log(`🧹 Iniciando limpieza masiva para dealer: ${bodyDealerId}`);
+      const config = await getGHLConfig(bodyDealerId, ghlClientId.value(), ghlClientSecret.value(), supabaseServiceKey.value());
+      const accessToken = config.access_token;
+      const finalLocationId = config.locationId;
+
+      const noisyTags = [
+        'compro', 'Compro', 'compró', 'COMPRO', 'Compró',
+        'cotizo', 'cotizado', 'cotizacion', 'cotización', 'cotizó',
+        'vendido', 'vendida', 'Vendido', 'VENDIDO', 'COTIZACION', 'COTIZÓ', 'COTIZADO'
+      ];
+
+      let allContacts = [];
+      let startAfterId = null;
+      let hasMore = true;
+
+      while (hasMore) {
+        let url = `https://services.leadconnectorhq.com/contacts/?locationId=${finalLocationId}&limit=100`;
+        if (startAfterId) url += `&startAfterId=${startAfterId}`;
+
+        const resContacts = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Version': '2021-07-28',
+            'Accept': 'application/json'
+          }
+        });
+        const contactDataResult = await resContacts.json();
+        const batch = contactDataResult.contacts || [];
+        allContacts = allContacts.concat(batch);
+
+        if (batch.length < 100) {
+          hasMore = false;
+        } else {
+          startAfterId = batch[batch.length - 1].id;
+        }
+      }
+
+      console.log(`👀 Analizando ${allContacts.length} contactos de GHL...`);
+      let cleanedCount = 0;
+
+      for (const contact of allContacts) {
+        const currentTags = contact.tags || [];
+        const hasDirty = currentTags.some(t => {
+          const lowerT = String(t).toLowerCase();
+          return noisyTags.some(n => n.toLowerCase() === lowerT);
+        });
+
+        if (hasDirty) {
+          const newTags = [];
+          if (currentTags.some(t => String(t).toLowerCase().includes('compro'))) newTags.push('COMPRÓ');
+          if (currentTags.some(t => String(t).toLowerCase().includes('cotiz'))) newTags.push('COTIZACIÓN');
+
+          // Borrar todas las variantes ruidosas detectadas
+          const tagsToRemove = currentTags.filter(t => {
+            const lowerT = String(t).toLowerCase();
+            return noisyTags.some(n => n.toLowerCase() === lowerT);
+          });
+
+          await fetch(`https://services.leadconnectorhq.com/contacts/${contact.id}/tags`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+            body: JSON.stringify({ tags: tagsToRemove })
+          });
+
+          if (newTags.length > 0) {
+            await fetch(`https://services.leadconnectorhq.com/contacts/${contact.id}/tags`, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Version': '2021-07-28' },
+              body: JSON.stringify({ tags: newTags })
+            });
+          }
+          cleanedCount++;
+        }
+      }
+      return res.status(200).json({ status: 'Limpieza masiva completada', totalContactsAnalyzed: allContacts.length, cleanedCount });
+    }
 
     console.log(`[${VERSION}] 🟢 Inicia apiGHL. Template: ${templateId}, Dealer: ${bodyDealerId}`);
 
@@ -2833,7 +3762,7 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
       // ⬇️ SIEMPRE usar formatter backend para estos campos (no confiar en getFrontendCf)
       { keys: ["millaje", "kilometraje"], value: fmtMil(rawMileage, veh) },
       { keys: ["tipo_de_vehculo", "tipo_vehiculo"], value: getFrontendCf('tipo') || String(veh.type || veh.bodyType || veh.tipo_vehiculo || "") },
-      { keys: ["condicion"], value: getFrontendCf('condicion') || String(veh.condition || veh.condicion || "") },
+      { keys: ["condicin", "condicion", "condición"], value: getFrontendCf('condicion') || String(veh.condition || veh.condicion || "") },
       { keys: ["carfax", "clean_carfax"], value: fmtCfx(veh.carfax || veh.clean_carfax) },
 
       // Mecánica
@@ -2857,6 +3786,7 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
       { keys: ["precio", "precio_rd", "precio_venta"], value: fmtCur(rawPrecio, monedaVenta) },
       { keys: ["inicial", "monto_a_financiar_rd", "pago_inicial"], value: fmtCur(rawInicial, monedaInicial) },
       { keys: ["banco_o_financiera", "banco", "financiera"], value: getFrontendCf('banco_o_financiera') || String(fin.banco || "").toUpperCase() },
+      { keys: ["tiempo_de_garanta", "tiempo_de_garantia", "tiempo_garantia"], value: getFrontendCf('tiempo_de_garanta') || String(fin.tiempo_garantia || fin.tiempoGarantia || "") },
 
       // Cliente Extra
       { keys: ["a_que_quien_va_dirigida", "a_quien_va_dirigida"], value: getFrontendCf('a_quien_va_dirigida') || `${cleanContactData.firstName || ''} ${cleanContactData.lastName || ''}`.trim().toUpperCase() },
@@ -2961,15 +3891,35 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
     }
 
     // ── AGREGAR ETIQUETAS AL CONTACTO ─────────────────────────────────────────
-    // Tags: marca del vehículo + acción (cotizó / compró)
+    // Standardize tags: Brand (MARCA) + Action (COMPRÓ / COTIZACIÓN) in Uppercase with Accents
     try {
       const veh = vehicleData || {};
       const make = (veh.make || veh.marca || '').trim().toUpperCase();
-      const isQuote = documentType === 'cotizacion';
-      // Add both variants for compatibility (cotizó/cotizado, compró/vendido)
-      const tagsToAdd = isQuote ? ['cotizó', 'cotizado'] : ['compró', 'vendido'];
+      const isQuote = String(documentType).toLowerCase().includes('cotiz');
+      
+      const tagsToAdd = isQuote ? ['COTIZACIÓN'] : ['COMPRÓ'];
       if (make) tagsToAdd.push(make);
 
+      // List of noisy or redundant tags to clean up from the contact
+      const noisyTags = [
+        'compro', 'Compro', 'compró', 'COMPRO', 'Compró',
+        'cotizo', 'cotizado', 'cotizacion', 'cotización', 'cotizó',
+        'vendido', 'vendida', 'Vendido', 'VENDIDO', 'COTIZACION', 'COTIZÓ', 'COTIZADO'
+      ];
+
+      // 1. Remove noisy tags (GHL V2 protocol)
+      // Note: We ignore errors here to ensure the process continues even if some tags aren't present
+      await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          Version: '2021-07-28',
+        },
+        body: JSON.stringify({ tags: noisyTags }),
+      }).catch(e => console.warn('[apiGHL] Error removiendo tags ruidosos:', e.message));
+
+      // 2. Add standardized tags
       await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
         method: 'POST',
         headers: {
@@ -2979,10 +3929,10 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
         },
         body: JSON.stringify({ tags: tagsToAdd }),
       });
-      console.log(`🏷️ Tags añadidos al contacto ${contactId}:`, tagsToAdd);
+      console.log(`🏷️ Tags estandarizados para contacto ${contactId}:`, tagsToAdd);
     } catch (tagErr) {
       // Non-fatal: log but don't fail the response
-      console.warn('[apiGHL] Error añadiendo tags:', tagErr.message);
+      console.warn('[apiGHL] Error procesando tags:', tagErr.message);
     }
 
     // GHL returns { document: { _id, ... } }
@@ -3953,145 +4903,518 @@ async function uploadToStorage({ supa, recordId, dealerId, buffer, contentType, 
     .eq('id', recordId);
 }
 
-// 21. Feed Público para Meta Commerce Manager (Duran Fernandez Auto)
-exports.metaFeedDuran = onRequest({ cors: true }, async (req, res) => {
-  const dealerId = '35594257-6176-4a79-a755-304179305938';
-  const catalogBaseUrl = 'https://carbotsystem.com/inventario/dura-n-ferna-ndez-auto-srl/catalogo';
+// Helper: Proxy Firebase Storage images through a public URL
+// Since Firebase bucket is private, we serve images through our Cloud Function
+const getPublicImageUrl = (url) => {
+  if (!url || typeof url !== 'string') return url;
+  if (!url.includes('firebasestorage.googleapis.com')) return url;
 
   try {
-    const inventoryMap = new Map(); // Para deduplicar por ID
+    // Convert Firebase URL to a format we can pass as a query parameter
+    // Route to the Firebase Cloud Function (not the Vercel app's /api route)
+    const encodedUrl = encodeURIComponent(url);
+    return `https://us-central1-carbot-5d709.cloudfunctions.net/imageProxy?url=${encodedUrl}`;
+  } catch (err) {
+    console.warn('getPublicImageUrl error, returning original:', err.message);
+    return url;
+  }
+};
 
-    // 1. Obtener de Firestore (Prioridad para estados actualizados en Dashboard)
-    const firestoreSnap = await db.collection("Dealers").doc(dealerId).collection("vehiculos").get();
-    firestoreSnap.forEach(doc => {
-      const data = doc.data();
-      const s = (data.status || data.estado || '').toLowerCase().trim();
-      const allowed = ['available', 'disponible']; // Solo disponibles para Meta
+// 20.5 Image Proxy - Serve Firebase Storage images publicly
+// Since Firebase bucket is private, this proxy downloads via Admin SDK and re-serves images
+exports.imageProxy = onRequest({ cors: true }, async (req, res) => {
+  const { url } = req.query;
+  if (!url) {
+    return res.status(400).json({ error: 'Missing url parameter' });
+  }
 
-      if (allowed.includes(s) && !data.is_trash && !data._deleted) {
-        inventoryMap.set(doc.id, {
-          id: doc.id,
-          titulo: `${data.year || ""} ${data.make || ""} ${data.model || ""} ${data.edition || ""}`.trim(),
-          precio: data.price || data.price_dop || 0,
-          moneda: data.currency || (data.price_dop > 0 ? 'DOP' : 'USD'),
-          inicial: data.initial_payment || data.initial_payment_dop || 0,
-          moneda_inicial: data.downPaymentCurrency || data.currency || 'USD',
-          millas: data.mileage || 0,
-          condicion: data.condition || data.condicion || 'Usado Importado',
-          marca: data.make,
-          fotos: data.images || (data.image ? [data.image] : []),
-          detalles: data
-        });
-      }
-    });
+  try {
+    const decodedUrl = decodeURIComponent(url);
+    // Match Firebase Storage download URL pattern:
+    //   https://firebasestorage.googleapis.com/v0/b/<bucket>/o/<encodedPath>?alt=media&token=...
+    const match = decodedUrl.match(/firebasestorage\.googleapis\.com\/v0\/b\/([^/]+)\/o\/([^?]+)/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+    const bucketName = match[1];
+    const objectPath = decodeURIComponent(match[2]);
+    console.log('imageProxy reading:', bucketName, objectPath);
 
-    // 2. Obtener de Supabase (Sincronización con catálogo real)
-    const { data: sbVehicles, error: sbError } = await supabase
-      .from('vehiculos')
-      .select('*')
-      .eq('dealer_id', dealerId)
-      .eq('estado', 'Disponible');
-
-    if (!sbError && sbVehicles) {
-      sbVehicles.forEach(v => {
-        const d = v.detalles || {};
-        if (d._deleted || d._deleted_at) return;
-
-        // Si ya está en Firestore, lo saltamos (Firestore es el source de verdad para el dashboard)
-        if (!inventoryMap.has(v.id)) {
-          inventoryMap.set(v.id, {
-            id: v.id,
-            titulo: `${v.anio || ''} ${v.marca || ''} ${v.modelo || ''} ${v.edicion || ''}`.trim(),
-            precio: v.precio || 0,
-            moneda: v.moneda_precio || 'USD',
-            inicial: v.inicial || 0,
-            moneda_inicial: v.moneda_inicial || v.moneda_precio || 'USD',
-            millas: v.millas || 0,
-            condicion: v.condicion || 'Usado Importado',
-            marca: v.marca,
-            fotos: v.fotos || [],
-            detalles: v.detalles
-          });
-        }
-      });
+    const bucket = admin.storage().bucket(bucketName);
+    const file = bucket.file(objectPath);
+    const [exists] = await file.exists();
+    if (!exists) {
+      return res.status(404).json({ error: 'File does not exist' });
     }
 
-    // 3. Generar CSV
-    // 3. Generar CSV (Strict RFC 4180)
-    const rows = Array.from(inventoryMap.values()).map(v => {
-      const d = v.detalles || {};
-      
-      // 1. Validar Imagen Principal
-      const images = Array.isArray(v.fotos) ? v.fotos : [];
-      const compatibleImages = images.filter(url => {
-        if (!url || typeof url !== 'string') return false;
-        const baseUrl = url.split('?')[0].toLowerCase();
-        return url.startsWith('https://') && baseUrl.match(/\.(jpg|jpeg|png|webp|bmp|gif)$/);
+    const [metadata] = await file.getMetadata();
+    const [buffer] = await file.download();
+
+    res.setHeader('Content-Type', metadata.contentType || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(200).send(buffer);
+  } catch (err) {
+    console.error('Image proxy error:', err.message, err.stack);
+    return res.status(500).json({ error: 'Failed to proxy image', message: err.message });
+  }
+});
+
+// 21. Feed Público para Meta Commerce Manager - Vehicles Catalog (Duran Fernandez Auto)
+// Schema: https://developers.facebook.com/docs/marketing-api/catalog/reference/#automotive
+exports.metaFeedDuran = onRequest({ cors: true }, async (req, res) => {
+  const dealerId = '35594257-6176-4a79-a755-304179305938';
+  const dealerSlug = 'dura-n-ferna-ndez-auto-srl';
+  const catalogBaseUrl = `https://carbotsystem.com/inventario/${dealerSlug}/catalogo`;
+
+  // Dirección del dealer (requerida por Meta Vehicles Catalog)
+  const DEALER_ADDRESS = {
+    addr1: 'Calle La Paz #14, Km 9 Autopista Duarte, Villa Marina',
+    city: 'Santo Domingo',
+    region: 'Distrito Nacional',
+    country: 'DO',
+    postal_code: '10608',
+  };
+  const DEALER_LAT = '18.4804326';
+  const DEALER_LON = '-69.9718115';
+
+  try {
+    // 1. Lectura dual (Firestore prioridad, Supabase fallback/complemento) — igual al catálogo público.
+    const firestoreSnap = await db.collection('Dealers').doc(dealerId).collection('vehiculos').get();
+
+    // Normalización de marca
+    const BRAND_MAP = {
+      NISSA: 'Nissan', NISSAN: 'Nissan', TOYOTA: 'Toyota', HONDA: 'Honda',
+      HYUNDAI: 'Hyundai', KIA: 'Kia', MAZDA: 'Mazda', CHEVROLET: 'Chevrolet',
+      FORD: 'Ford', DODGE: 'Dodge', JEEP: 'Jeep', MITSUBISHI: 'Mitsubishi',
+      SUBARU: 'Subaru', LEXUS: 'Lexus', INFINITI: 'Infiniti', ACURA: 'Acura',
+      BMW: 'BMW', 'MERCEDES-BENZ': 'Mercedes-Benz', 'MERCEDES BENZ': 'Mercedes-Benz',
+      MERCEDES: 'Mercedes-Benz', AUDI: 'Audi', VOLKSWAGEN: 'Volkswagen', VW: 'Volkswagen',
+      VOLVO: 'Volvo', PORSCHE: 'Porsche', 'LAND ROVER': 'Land Rover',
+      'RANGE ROVER': 'Land Rover', MINI: 'MINI', FIAT: 'Fiat', SUZUKI: 'Suzuki',
+      TESLA: 'Tesla', CADILLAC: 'Cadillac', GMC: 'GMC', CHRYSLER: 'Chrysler',
+      BUICK: 'Buick', LINCOLN: 'Lincoln', JAGUAR: 'Jaguar',
+    };
+    const normalizeBrand = (raw) => {
+      const key = String(raw || '').trim().toUpperCase();
+      if (!key) return '';
+      return BRAND_MAP[key] || key.charAt(0) + key.slice(1).toLowerCase();
+    };
+    const cleanSpaces = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+    // Enum body_style válido de Meta: CONVERTIBLE, COUPE, HATCHBACK, MINIVAN,
+    // TRUCK, SUV, SEDAN, VAN, WAGON, CROSSOVER, SMALL_CAR, OTHER
+    const inferBodyStyle = (data) => {
+      const raw = String(data.body_style || data.bodyStyle || data.tipo || data.tipo_vehiculo || '').toUpperCase().trim();
+      const map = {
+        SEDAN: 'SEDAN', SEDÁN: 'SEDAN', SUV: 'SUV', COUPE: 'COUPE', COUPÉ: 'COUPE',
+        HATCHBACK: 'HATCHBACK', CONVERTIBLE: 'CONVERTIBLE', PICKUP: 'TRUCK',
+        TRUCK: 'TRUCK', CAMIONETA: 'TRUCK', VAN: 'VAN', MINIVAN: 'MINIVAN',
+        WAGON: 'WAGON', CROSSOVER: 'CROSSOVER', JEEPETA: 'SUV',
+      };
+      if (map[raw]) return map[raw];
+      // Inferir por modelo/edicion si no hay campo directo
+      const model = String(data.model || '').toUpperCase();
+      const edition = String(data.edition || '').toUpperCase();
+      const hint = `${model} ${edition}`;
+      if (/ROGUE|TUCSON|CR-V|CRV|RAV4|EQUINOX|TRAX|CX-5|CX5|SANTA FE|PILOT|HIGHLANDER|PATHFINDER|EXPLORER|SORENTO|TELLURIDE|PALISADE/.test(hint)) return 'SUV';
+      if (/SILVERADO|F-150|F150|TACOMA|TUNDRA|RANGER|RAM|FRONTIER/.test(hint)) return 'TRUCK';
+      if (/CIVIC|COROLLA|SENTRA|ACCORD|CAMRY|ALTIMA|ELANTRA|SONATA|CLASE C|CLASE E|SERIE 3|SERIE 5|530E/.test(hint)) return 'SEDAN';
+      return 'OTHER';
+    };
+
+    // Meta exige lowercase: new | used | cpo
+    const STATE_MAP = {
+      NUEVO: 'new', NEW: 'new',
+      USADO: 'used', USED: 'used',
+      'USADO IMPORTADO': 'used',
+      'USADO LOCAL': 'used',
+      'RECIEN IMPORTADO': 'used',
+      'CERTIFIED PRE-OWNED': 'cpo', CPO: 'cpo',
+    };
+    const inferState = (data) => {
+      const raw = String(data.condition || data.condicion || 'USED').toUpperCase().trim()
+        .normalize('NFD').replace(/[̀-ͯ]/g, '');
+      return STATE_MAP[raw] || (raw.includes('NUEVO') || raw === 'NEW' ? 'new' : 'used');
+    };
+
+    const allowed = ['available', 'disponible', 'quoted', 'cotizado'];
+    const inventoryMap = new Map();
+
+    firestoreSnap.forEach((doc) => {
+      const data = doc.data();
+      const s = (data.status || data.estado || '').toLowerCase().trim();
+      if (!allowed.includes(s)) return;
+      if (data.is_trash || data._deleted || data._deleted_at) return;
+      inventoryMap.set(doc.id, { id: doc.id, ...data });
+    });
+
+    // Supabase como complemento (misma lógica del catálogo público)
+    try {
+      const { data: sbVehicles } = await supabase
+        .from('vehiculos')
+        .select('*')
+        .eq('dealer_id', dealerId);
+
+      (sbVehicles || []).forEach((v) => {
+        const d = v.detalles || {};
+        const s = (v.estado || '').toLowerCase().trim();
+        if (!allowed.includes(s)) return;
+        if (v.deleted_at || v.is_trash || d._deleted || d._deleted_at || d.is_trash) return;
+        if (inventoryMap.has(v.id)) return; // Firestore gana
+
+        // Mapear Supabase → shape Firestore-like
+        inventoryMap.set(v.id, {
+          id: v.id,
+          make: v.marca || d.make || d.marca,
+          model: v.modelo || d.model || d.modelo,
+          year: v.anio || d.year || d.anio,
+          edition: v.edicion || d.edition || d.edicion,
+          color: v.color || d.color || d.exteriorColor,
+          transmission: v.transmision || d.transmission,
+          fuel: v.combustible || d.fuel,
+          engine: d.engine || d.motor,
+          traction: v.traccion || d.traction || d.drivetrain,
+          mileage: v.millas || d.mileage || 0,
+          mileage_unit: d.mileage_unit || d.unit || 'KM',
+          vin: v.chasis || d.vin || d.chassis,
+          price: v.precio || d.price || d.price_dop || 0,
+          price_dop: d.price_dop,
+          currency: v.moneda_precio || d.currency || 'USD',
+          condition: v.condicion || d.condition || 'USED',
+          clean_carfax: v.condicion_carfax || d.clean_carfax,
+          body_style: d.body_style || d.bodyStyle || d.tipo || d.tipo_vehiculo,
+          images: [
+            ...(Array.isArray(v.fotos) ? v.fotos : []),
+            ...(Array.isArray(d.images) ? d.images : []),
+            ...(Array.isArray(d.fotos) ? d.fotos : []),
+          ],
+          image: d.image || d.imagen || d.main_image,
+          estado: v.estado,
+        });
       });
-      
-      let final_image_link = compatibleImages[0];
-      let description_suffix = '';
-      
-      if (!final_image_link) {
-        final_image_link = 'https://images.unsplash.com/photo-1533473359331-0135ef1b58bf?auto=format&fit=crop&q=80&w=800';
-        description_suffix = '\n\n⚠️ Fotos en proceso...';
+    } catch (e) {
+      console.error('Meta feed Supabase error (non-fatal):', e.message);
+    }
+
+    const inventory = Array.from(inventoryMap.values());
+
+    // Escape estricto RFC 4180
+    const esc = (text) => `"${String(text == null ? '' : text).replace(/"/g, '""')}"`;
+
+    const rows = inventory.flatMap((data) => {
+      const priceCheck = Number(String(data.price || data.price_dop || 0).replace(/,/g, '')) || 0;
+      // Excluir vehículos sin precio, sin imagen principal, o sin make/model/year
+      if (priceCheck <= 0) return [];
+      if (!data.make || !data.model || !data.year) return [];
+
+      const brandClean = normalizeBrand(data.make);
+      const model = cleanSpaces(data.model) || 'N/A';
+      const year = parseInt(data.year) || new Date().getFullYear();
+      const trim = cleanSpaces(data.edition || data.version || '');
+      const bodyStyle = inferBodyStyle(data);
+      const stateOfVehicle = inferState(data);
+
+      // Título legible
+      const title = cleanSpaces(`${year} ${brandClean} ${model} ${trim}`);
+
+      // Descripción con nuevo formato: Precio | Inicial | Millaje | Estado | Características
+      const priceNum = Number(String(data.price || data.price_dop || 0).replace(/,/g, '')) || 0;
+      const currency = data.currency === 'RD$' ? 'RD$'
+                       : data.currency === 'US$' ? 'US$'
+                       : (data.price_dop > 0 ? 'RD$' : 'US$');
+
+      // Información de precio e inicial
+      const priceFormatted = `${priceNum.toLocaleString('es-DO', { maximumFractionDigits: 0 })}`;
+      const initialPrice = data.initial_payment || data.inicial || priceNum * 0.25; // Por defecto 25% del precio
+      const initialFormatted = `${Number(initialPrice).toLocaleString('es-DO', { maximumFractionDigits: 0 })}`;
+
+      // Millaje formateado — Meta exige MI o KM (uppercase)
+      const mileageVal = parseInt(String(data.mileage || 0).replace(/[^\d]/g, '')) || 0;
+      const unitRaw = String(data.mileage_unit || data.unit || 'KM').toUpperCase();
+      const mileageUnit = unitRaw.startsWith('MI') ? 'MI' : 'KM';
+      const mileageFormatted = `${mileageVal.toLocaleString('es-DO')} ${mileageUnit}`;
+
+      // Estado del vehículo
+      const cleanCarfax = (data.clean_carfax === 'Sí' || data.clean_carfax === 'Si' || data.clean_carfax === true);
+      const isNewImport = (data.recently_imported === 'Sí' || data.recently_imported === 'Si' || data.recently_imported === true ||
+                          data.recien_importada === 'Sí' || data.recien_importada === 'Si' || data.recien_importada === true);
+      const firstOwnerRD = (data.first_owner_rd === 'Sí' || data.first_owner_rd === 'Si' || data.first_owner_rd === true ||
+                           data.primer_dueno === 'Sí' || data.primer_dueno === 'Si' || data.primer_dueno === true);
+
+      // Construir estado
+      let stateDesc = '';
+      if (isNewImport) {
+        stateDesc = 'Recién importada';
+        if (cleanCarfax) stateDesc += ' | Clean Carfax';
+        if (firstOwnerRD) stateDesc += ' | Primer dueño en RD';
+      } else {
+        stateDesc = 'Usado en el País';
       }
 
-      // 2. Formateo de Precios y Moneda
-      const priceVal = String(v.precio || 0).replace(/,/g, '');
-      const currency = v.moneda === 'RD$' ? 'DOP' : v.moneda === 'US$' ? 'USD' : v.moneda;
-      const priceStr = `${currency} ${priceVal}`;
-      
-      // 3. Descripción
-      const fmt = (val) => Number(val || 0).toLocaleString('en-US');
-      const initialStr = `${v.moneda_inicial === 'RD$' ? 'DOP' : v.moneda_inicial === 'US$' ? 'USD' : v.moneda_inicial} ${fmt(v.inicial)}`;
-      const mileageStr = `${fmt(v.millas)} km`;
+      // Características principales (features)
+      const features = [];
+      if (data.features) {
+        const featuresArray = Array.isArray(data.features) ? data.features : String(data.features).split(',');
+        features.push(...featuresArray.map(f => f.trim()).filter(f => f));
+      }
+      // Agregar características comunes si existen como campos
+      if (data.rear_camera === true || data.rear_camera === 'Sí' || data.rear_camera === 'Si') features.push('Cámara de reversa');
+      if (data.sunroof === true || data.sunroof === 'Sí' || data.sunroof === 'Si') features.push('Techo panorámico');
+      if (data.leather_seats === true || data.leather_seats === 'Sí' || data.leather_seats === 'Si') features.push('Asientos en piel');
+      if (data.four_wheel === true || data.four_wheel === '4x4' || data.traction?.includes('4x4')) features.push('Tracción 4x4');
+      if (data.apple_carplay === true || data.apple_carplay === 'Sí' || data.apple_carplay === 'Si') features.push('Apple CarPlay y Android Auto');
+      if (data.air_suspension === true || data.air_suspension === 'Sí' || data.air_suspension === 'Si') features.push('Suspensión de aire');
 
-      const isImported = (v.condicion || "").toLowerCase().includes("importado") || v.condicion === "Nuevo";
-      const importStatus = isImported ? "Recién importada | Clean Carfax" : "Usado en el País";
+      // Construir descripción final
+      const descriptionParts = [
+        `Precio: ${currency} ${priceFormatted}`,
+        `Inicial: ${currency} ${initialFormatted}`,
+        `Millaje: ${mileageFormatted}`,
+        '',
+        stateDesc,
+      ];
 
-      const extras = [];
-      if (d.motor || d.engine) extras.push(`• Motor: ${d.motor || d.engine}`);
-      if (d.transmission || d.transmision) extras.push(`• Transmisión: ${d.transmission || d.transmision}`);
-      if (d.fuel || d.combustible) extras.push(`• Combustible: ${d.fuel || d.combustible}`);
-      if (d.color) extras.push(`• Color: ${d.color}`);
-      
-      const description = `Precio: ${v.moneda} ${fmt(v.precio)}\nInicial: ${initialStr}\nMillaje: ${mileageStr}\n\n${importStatus}\n\n${extras.join('\n')}${description_suffix}`;
-      
-      const link = `${catalogBaseUrl}?dealer=${dealerId}&vehicleID=${v.id}`;
-      const additional_image_link = compatibleImages.slice(1, 11).join(',');
+      if (features.length > 0) {
+        descriptionParts.push('');
+        features.forEach(f => descriptionParts.push(`• ${f}`));
+      }
 
-      // Función de escapado estricto
-      const esc = (text) => `"${String(text || '').replace(/"/g, '""')}"`;
+      const description = descriptionParts.join('\n') || `${title} disponible en Durán Fernández Auto.`;
+
+      // Precio formateado para Meta (numérico)
+      // Nota: Currency arriba ya está en formato local (RD$ o US$)
+      // Para Meta, necesitamos el número puro
+      const priceStr = `${priceNum.toFixed(2)}`;
+
+      // Imágenes: consolidar desde todas las fuentes posibles, deduplicar y filtrar incompatibles con Meta.
+      // Meta soporta: jpg, jpeg, png, webp, bmp, gif. NO soporta: heic, heif, tiff, raw.
+      const rawSources = [
+        data.images,
+        data.fotos,
+        data.photos,
+        data.gallery,
+        data.image,
+        data.photo,
+        data.main_image,
+        data.imagen,
+      ];
+      const flat = [];
+      rawSources.forEach((src) => {
+        if (Array.isArray(src)) flat.push(...src);
+        else if (typeof src === 'string') flat.push(src);
+      });
+      const seen = new Set();
+      const compat = [];
+      for (const u of flat) {
+        if (!u || typeof u !== 'string') continue;
+        if (!u.startsWith('https://')) continue;
+        const base = u.split('?')[0].toLowerCase();
+        // Excluir formatos no soportados por Meta
+        if (/\.(heic|heif|tiff|tif|raw|bmp)$/.test(base)) continue;
+        // Aceptar extensiones válidas
+        if (!/\.(jpg|jpeg|png|webp|gif)$/.test(base)) continue;
+        // Deduplicar por URL base (sin query params)
+        if (seen.has(base)) continue;
+        seen.add(base);
+        compat.push(u);
+      }
+      // Convert all Firebase Storage URLs to public downloadable URLs (no token expiration)
+      const publicCompat = compat.map(url => {
+        const converted = getPublicImageUrl(url);
+        if (url !== converted) {
+          console.log(`✓ Converted image URL from Firebase token-based to public CDN`);
+        }
+        return converted;
+      });
+      if (publicCompat.length === 0) {
+        console.warn(`⚠️ Vehicle ${data.id}: No images found after filtering`);
+      } else {
+        console.log(`✓ Vehicle ${data.id}: ${publicCompat.length} images converted to public URLs`);
+      }
+      const mainImage = publicCompat[0] || 'https://images.unsplash.com/photo-1533473359331-0135ef1b58bf?auto=format&fit=crop&q=80&w=1200';
+      // Meta permite hasta 20 additional_image_link
+      const additionalImages = publicCompat.slice(1, 21).join(',');
+
+      // URL al detalle en el catálogo público (canonical)
+      const url = `https://carbotsystem.com/inventario/${dealerSlug}/vehiculo/${data.id}`;
+
+      // Color exterior
+      const exteriorColor = cleanSpaces(data.color || '');
+
+      // VIN (opcional pero recomendado)
+      const vin = cleanSpaces(data.vin || data.chassis || '').toUpperCase();
+
+      // Transmission enum: AUTOMATIC | MANUAL | OTHER
+      const txRaw = String(data.transmission || data.transmision || '').toUpperCase();
+      const transmission = txRaw.includes('AUTO') ? 'AUTOMATIC'
+                          : txRaw.includes('MANU') ? 'MANUAL'
+                          : 'OTHER';
+
+      // Fuel type enum: DIESEL | ELECTRIC | FLEX | GASOLINE | HYBRID | OTHER
+      const fuelRaw = String(data.fuel || data.combustible || '').toUpperCase();
+      const fuelType = fuelRaw.includes('DIESEL') ? 'DIESEL'
+                      : fuelRaw.includes('ELECTR') ? 'ELECTRIC'
+                      : fuelRaw.includes('HIBR') || fuelRaw.includes('HYBR') ? 'HYBRID'
+                      : fuelRaw.includes('FLEX') ? 'FLEX'
+                      : fuelRaw.includes('GAS') ? 'GASOLINE'
+                      : 'OTHER';
+
+      // Drivetrain enum: 4X2 | 4X4 | AWD | FWD | RWD | OTHER
+      const drRaw = String(data.traction || data.drivetrain || data.traccion || '').toUpperCase();
+      const drivetrain = drRaw.includes('4X4') ? '4X4'
+                        : drRaw.includes('AWD') ? 'AWD'
+                        : drRaw.includes('FWD') ? 'FWD'
+                        : drRaw.includes('RWD') ? 'RWD'
+                        : drRaw.includes('4X2') ? '4X2'
+                        : 'OTHER';
+
+      // vehicle_offer_id: stable unique ID derived from vehicle UUID — never changes
+      const vehicleOfferId = `DURAN_${String(data.id).replace(/-/g, '').slice(0, 12).toUpperCase()}`;
+      const availability = 'in stock';
+
+      // ── Required-field gate (Meta spec) ──────────────────────────────
+      const vehicleId = data.id;
+      if (!vehicleId || !vehicleOfferId || !title || priceNum <= 0 || !availability) {
+        console.warn(`⚠️ Skipping vehicle ${vehicleId || 'unknown'}: missing required Meta field`);
+        return [];
+      }
 
       return [
-        esc(v.id),
-        esc(v.titulo),
-        esc(description),
-        esc('in stock'),
-        esc(v.condicion === 'Nuevo' ? 'new' : 'used'),
-        esc(priceStr),
-        esc(link),
-        esc(final_image_link),
-        esc(additional_image_link),
-        esc(v.marca)
+        esc(vehicleId),                   // vehicle_id
+        esc(vehicleOfferId),              // vehicle_offer_id
+        esc(title),                       // title
+        esc(description),                 // description
+        esc(url),                         // url
+        esc(mainImage),                   // image[0].url
+        esc(additionalImages),            // additional_image_link
+        esc(brandClean),                  // make
+        esc(model),                       // model
+        esc(year),                        // year
+        esc(trim),                        // trim
+        esc(bodyStyle),                   // body_style
+        esc(stateOfVehicle),              // state_of_vehicle
+        esc(mileageVal),                  // mileage.value
+        esc(mileageUnit),                 // mileage.unit
+        esc(exteriorColor),               // exterior_color
+        esc(transmission),                // transmission
+        esc(fuelType),                    // fuel_type
+        esc(drivetrain),                  // drivetrain
+        esc(vin),                         // vin
+        esc(priceStr),                    // price
+        esc(availability),                // availability
+        esc(DEALER_ADDRESS.addr1),        // address.addr1
+        esc(DEALER_ADDRESS.city),         // address.city
+        esc(DEALER_ADDRESS.region),       // address.region
+        esc(DEALER_ADDRESS.country),      // address.country
+        esc(DEALER_ADDRESS.postal_code),  // address.postal_code
+        esc(DEALER_LAT),                  // latitude
+        esc(DEALER_LON),                  // longitude
       ].join(',');
     });
 
-    const headers = ['id', 'title', 'description', 'availability', 'condition', 'price', 'link', 'image_link', 'additional_image_link', 'brand']
-      .map(h => `"${h}"`).join(',');
-      
+    const headers = [
+      'vehicle_id', 'vehicle_offer_id', 'title', 'description', 'url', 'image[0].url', 'additional_image_link',
+      'make', 'model', 'year', 'trim', 'body_style', 'state_of_vehicle',
+      'mileage.value', 'mileage.unit', 'exterior_color', 'transmission', 'fuel_type',
+      'drivetrain', 'vin', 'price', 'availability',
+      'address.addr1', 'address.city', 'address.region', 'address.country', 'address.postal_code',
+      'latitude', 'longitude',
+    ].map((h) => `"${h}"`).join(',');
+
     const csvContent = [headers, ...rows].join('\n');
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename=meta_feed_duran.csv');
-    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate');
-    
-    // Añadimos UTF-8 BOM para asegurar que Meta lea bien los acentos
-    return res.status(200).send('\ufeff' + csvContent);
-
+    res.setHeader('Cache-Control', 's-maxage=30, stale-while-revalidate=300');
+    return res.status(200).send(csvContent);
   } catch (err) {
     console.error('Meta Feed Error:', err);
     return res.status(500).json({ error: 'Internal Server Error', details: err.message });
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// 💱 Recálculo diario del inicial automático con la tasa del día
+// ──────────────────────────────────────────────────────────────────
+// Solo toca dealers con `tasa_auto_diaria = true`. Para los demás la tasa está
+// congelada y sus iniciales no se mueven hasta que el dealer los cambie.
+// Solo se recalculan los vehículos con `inicial_automatico = true`: un inicial
+// escrito por el dealer nunca se sobreescribe.
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+
+exports.recalcInicialesDiario = onSchedule(
+  {
+    schedule: "0 8 * * *",
+    timeZone: "America/Santo_Domingo",
+    secrets: [supabaseServiceKey],
+    region: "us-central1",
+  },
+  async () => {
+    const supa = createClient(SUPABASE_URL, supabaseServiceKey.value());
+
+    // Tasa del día desde la fuente compartida (?force=1 salta la caché de 2h
+    // para que la corrida diaria siempre traiga la cotización fresca).
+    let perUsd = null;
+    try {
+      const r = await fetch(`${SUPABASE_URL}/functions/v1/exchange-rate?force=1`);
+      const d = await r.json();
+      perUsd = d?.perUsd?.USD ? d.perUsd : null;
+    } catch (e) {
+      console.error("recalcInicialesDiario: no se pudo leer la tasa", e);
+    }
+    if (!perUsd) {
+      console.error("recalcInicialesDiario: sin tasa, se aborta sin tocar datos");
+      return;
+    }
+
+    const { data: dealers, error: dErr } = await supa
+      .from("dealers")
+      .select("id, nombre, moneda_principal, moneda_secundaria, porcentaje_inicial_auto")
+      .eq("tasa_auto_diaria", true);
+    if (dErr) {
+      console.error("recalcInicialesDiario: error leyendo dealers", dErr);
+      return;
+    }
+    if (!dealers?.length) {
+      console.log("recalcInicialesDiario: ningún dealer con tasa automática");
+      return;
+    }
+
+    for (const dealer of dealers) {
+      const primary = dealer.moneda_principal || "DOP";
+      const pct = (dealer.porcentaje_inicial_auto > 0 ? Number(dealer.porcentaje_inicial_auto) : 30) / 100;
+      if (!(perUsd[primary] > 0)) {
+        console.warn(`recalcInicialesDiario: sin tasa para ${primary}, se salta ${dealer.nombre}`);
+        continue;
+      }
+
+      const { data: rows, error: vErr } = await supa
+        .from("vehiculos")
+        .select("id, precio, moneda_precio")
+        .eq("dealer_id", dealer.id)
+        .eq("inicial_automatico", true)
+        .is("deleted_at", null)
+        .gt("precio", 0);
+      if (vErr) {
+        console.error(`recalcInicialesDiario: error leyendo vehículos de ${dealer.nombre}`, vErr);
+        continue;
+      }
+      if (!rows?.length) continue;
+
+      let ok = 0;
+      for (const v of rows) {
+        const from = perUsd[v.moneda_precio] || perUsd[primary];
+        // amount * (primary por USD) / (moneda origen por USD) = amount en primary
+        const priceInPrimary = (Number(v.precio) * perUsd[primary]) / from;
+        if (!(priceInPrimary > 0)) continue;
+        const { error: uErr } = await supa
+          .from("vehiculos")
+          .update({ inicial: Math.round(priceInPrimary * pct), moneda_inicial: primary })
+          .eq("id", v.id);
+        if (!uErr) ok++;
+      }
+      console.log(`recalcInicialesDiario: ${dealer.nombre} → ${ok}/${rows.length} actualizados (1 USD = ${perUsd[primary]} ${primary}, ${pct * 100}%)`);
+    }
+  }
+);
