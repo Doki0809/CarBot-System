@@ -116,6 +116,10 @@ export const prepararPayloadGHL = (cliente, vehiculo, locationId) => {
             { id: "banco_o_financiera", key: "banco_o_financiera", value: (cliente.banco || "").toUpperCase() },
             { id: "tiempo_de_garanta", key: "tiempo_de_garanta", value: cliente.tiempoGarantia || "" },
 
+            // 4.1 Ubicación (campos personalizados, no estándar de GHL)
+            { id: "num_casaapartamento", key: "num_casaapartamento", value: (cliente.aptNumber || "").toUpperCase() },
+            { id: "sector", key: "sector", value: (cliente.sector || "").toUpperCase() },
+
             // 5. Otros datos
             { id: "a_quien_va_dirigida", key: "a_quien_va_dirigida", value: `${cliente.nombre || ''} ${cliente.apellido || ''}`.trim().toUpperCase() },
             { id: "cedula", key: "cedula", value: cliente.cedula || "" }
@@ -133,6 +137,13 @@ export const prepararPayloadGHL = (cliente, vehiculo, locationId) => {
             payload.phone = normalizedPhone;
         }
     }
+
+    // Dirección — campos estándar del contacto en GHL (no van en customFields)
+    if (cliente.address1 && cliente.address1.trim()) payload.address1 = cliente.address1.trim();
+    if (cliente.city && cliente.city.trim()) payload.city = cliente.city.trim();
+    if (cliente.state && cliente.state.trim()) payload.state = cliente.state.trim();
+    if (cliente.country && cliente.country.trim()) payload.country = cliente.country.trim();
+    if (cliente.postalCode && String(cliente.postalCode).trim()) payload.postalCode = String(cliente.postalCode).trim();
 
     return payload;
 };

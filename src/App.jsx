@@ -31,7 +31,8 @@ import {
   PlusCircle, Box, ArrowUpRight, Building2, Fingerprint, Lock, EyeOff, Share2, Check, ArrowRight, Key, Copy, Link,
   AlertTriangle, TrendingUp, History, Bell, Calendar, Briefcase, Inbox, Headset, Sparkles, Camera,
   ChevronLeft, ChevronRight, Save, ChevronDown, MoreVertical, FileCode, AtSign, Building, LayoutGrid, ShieldCheck,
-  Phone, Mail, RefreshCw, Users, MessageCircle, UploadCloud, FileSpreadsheet, Table2, Clock
+  Phone, Mail, RefreshCw, Users, MessageCircle, UploadCloud, FileSpreadsheet, Table2, Clock,
+  MapPin, Home, Compass, Globe, Hash
 } from 'lucide-react';
 import VinDecoderSection from './components/VinDecoderSection.jsx';
 import { mapVinToFormFields } from './utils/vinDecoder.js';
@@ -1805,6 +1806,13 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
   const [inicialCurrency, setInicialCurrency] = useState('USD');
   const [clientPhone, setClientPhone] = useState('');
   const [clientEmail, setClientEmail] = useState('');
+  const [clientAddress1, setClientAddress1] = useState('');
+  const [clientAptNumber, setClientAptNumber] = useState('');
+  const [clientSector, setClientSector] = useState('');
+  const [clientCity, setClientCity] = useState('');
+  const [clientState, setClientState] = useState('');
+  const [clientCountry, setClientCountry] = useState('');
+  const [clientPostalCode, setClientPostalCode] = useState('');
   const [bankName, setBankName] = useState('');
   const [warrantyValue, setWarrantyValue] = useState(12);
   const [warrantyUnit, setWarrantyUnit] = useState('meses');
@@ -1992,6 +2000,13 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       setClientCedula(initialVehicle.cedula || initialVehicle.id_number || '');
       setClientPhone(String(initialVehicle.phone || initialVehicle.tel || ''));
       setClientEmail(initialVehicle.email || initialVehicle.mail || '');
+      setClientAddress1((initialVehicle.address1 || initialVehicle.direccion || '').toUpperCase());
+      setClientAptNumber((initialVehicle.aptNumber || initialVehicle.num_casaapartamento || '').toUpperCase());
+      setClientSector((initialVehicle.sector || '').toUpperCase());
+      setClientCity((initialVehicle.city || initialVehicle.ciudad || '').toUpperCase());
+      setClientState((initialVehicle.state || initialVehicle.provincia || '').toUpperCase());
+      setClientCountry((initialVehicle.country || initialVehicle.pais || 'República Dominicana').toUpperCase());
+      setClientPostalCode(initialVehicle.postalCode || initialVehicle.codigoPostal || '');
       setBankName(initialVehicle.bankName || initialVehicle.bank || initialVehicle.banco || '');
       setWarrantyValue(Number(initialVehicle.warrantyValue || initialVehicle.tiempo_garantia_valor) || 12);
       setWarrantyUnit(initialVehicle.warrantyUnit || initialVehicle.tiempo_garantia_unidad || 'meses');
@@ -2023,6 +2038,13 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       setClientPhone('');
       setClientEmail('');
       setClientCedula('');
+      setClientAddress1('');
+      setClientAptNumber('');
+      setClientSector('');
+      setClientCity('');
+      setClientState('');
+      setClientCountry('República Dominicana');
+      setClientPostalCode('');
       setBankName('');
       setWarrantyValue(12);
       setWarrantyUnit('meses');
@@ -2098,7 +2120,14 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
         inicial: downPayment,
         monedaVenta: priceCurrency,
         monedaInicial: inicialCurrency,
-        tiempoGarantia: `${warrantyValueNum} ${warrantyUnitLabel}`
+        tiempoGarantia: `${warrantyValueNum} ${warrantyUnitLabel}`,
+        address1: clientAddress1,
+        aptNumber: clientAptNumber,
+        sector: clientSector,
+        city: clientCity,
+        state: clientState,
+        country: clientCountry,
+        postalCode: clientPostalCode
       };
 
       // GHL Location ID resolution
@@ -2597,6 +2626,58 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                       required
                     />
                   </div>
+
+                  <div className="col-span-1 sm:col-span-2">
+                    <Input
+                      label="DIRECCIÓN POSTAL"
+                      placeholder="CALLE, NÚMERO"
+                      icon={MapPin}
+                      value={clientAddress1}
+                      onChange={(e) => { setClientAddress1(e.target.value.toUpperCase()); }}
+                    />
+                  </div>
+                  <Input
+                    label="NUM. CASA/APARTAMENTO"
+                    placeholder="EJ. #12"
+                    icon={Home}
+                    value={clientAptNumber}
+                    onChange={(e) => { setClientAptNumber(e.target.value.toUpperCase()); }}
+                  />
+                  <Input
+                    label="SECTOR"
+                    placeholder="EJ. PIANTINI"
+                    icon={Compass}
+                    value={clientSector}
+                    onChange={(e) => { setClientSector(e.target.value.toUpperCase()); }}
+                  />
+                  <Input
+                    label="CIUDAD"
+                    placeholder="EJ. SANTO DOMINGO"
+                    icon={Building}
+                    value={clientCity}
+                    onChange={(e) => { setClientCity(e.target.value.toUpperCase()); }}
+                  />
+                  <Input
+                    label="PROVINCIA/ESTADO"
+                    placeholder="EJ. DISTRITO NACIONAL"
+                    icon={MapPin}
+                    value={clientState}
+                    onChange={(e) => { setClientState(e.target.value.toUpperCase()); }}
+                  />
+                  <Input
+                    label="PAÍS"
+                    placeholder="REPÚBLICA DOMINICANA"
+                    icon={Globe}
+                    value={clientCountry}
+                    onChange={(e) => { setClientCountry(e.target.value.toUpperCase()); }}
+                  />
+                  <Input
+                    label="CÓDIGO POSTAL"
+                    placeholder="EJ. 10101"
+                    icon={Hash}
+                    value={clientPostalCode}
+                    onChange={(e) => { setClientPostalCode(e.target.value); }}
+                  />
                 </div>
               </section>
 

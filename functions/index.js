@@ -3602,6 +3602,8 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
         const cfData = await cfRes.json();
         remoteCustomFields = cfData.customFields || [];
         console.log(`✅ Obtenidos ${remoteCustomFields.length} Custom Fields de la Location`);
+        const garantMatches = remoteCustomFields.filter(cf => (cf.fieldKey || "").toLowerCase().includes('garant') || (cf.name || "").toLowerCase().includes('garant'));
+        console.log(`🔎 DEBUG garantia fields:`, JSON.stringify(garantMatches.map(cf => ({ id: cf.id, fieldKey: cf.fieldKey, name: cf.name }))));
       } else {
         const errText = await cfRes.text();
         console.warn(`⚠️ No se pudieron cargar los Custom Fields de GHL. Status: ${cfRes.status}, Body: ${errText}`);
@@ -3792,7 +3794,12 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
       { keys: ["a_que_quien_va_dirigida", "a_quien_va_dirigida"], value: getFrontendCf('a_quien_va_dirigida') || `${cleanContactData.firstName || ''} ${cleanContactData.lastName || ''}`.trim().toUpperCase() },
       { keys: ["cdula", "cedula", "cédula"], value: getFrontendCf('cedula') || String(cedulaFromFrontend) },
       { keys: ["placa"], value: getFrontendCf('placa') || String(veh.plate || veh.placa || "").toUpperCase() },
-      { keys: ["cilindros"], value: getFrontendCf('cilindros') || String(veh.cilindros || veh.engine_cyl || "") }
+      { keys: ["cilindros"], value: getFrontendCf('cilindros') || String(veh.cilindros || veh.engine_cyl || "") },
+
+      // Ubicación (custom fields, no estándar — address1/city/state/country/postalCode
+      // ya van directo en el root del contacto vía cleanContactData)
+      { keys: ["num_casaapartamento", "num_casa_apartamento"], value: getFrontendCf('num_casaapartamento') || "" },
+      { keys: ["sector"], value: getFrontendCf('sector') || "" }
     ];
 
     // Construir el array final buscando dinámicamente los IDs en la cuenta de GHL actual (Multi-Tenant)
