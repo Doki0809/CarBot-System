@@ -234,81 +234,6 @@ const Input = ({ label, className = "", type = "text", error, ...props }) => (
   </div>
 );
 
-// --- WHEEL PICKER (slot-machine style scroll picker) ---
-const WheelPicker = ({ items, value, onChange, itemHeight = 40, visibleCount = 5 }) => {
-  const containerRef = useRef(null);
-  const scrollTimeoutRef = useRef(null);
-  const height = itemHeight * visibleCount;
-  const padCount = Math.floor(visibleCount / 2);
-
-  const selectedIndex = items.findIndex(it => it.value === value);
-
-  useLayoutEffect(() => {
-    const el = containerRef.current;
-    if (!el || selectedIndex < 0) return;
-    el.scrollTop = selectedIndex * itemHeight;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el || selectedIndex < 0) return;
-    const target = selectedIndex * itemHeight;
-    if (Math.abs(el.scrollTop - target) > itemHeight / 2) {
-      el.scrollTop = target;
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value]);
-
-  const handleScroll = () => {
-    if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
-    scrollTimeoutRef.current = setTimeout(() => {
-      const el = containerRef.current;
-      if (!el) return;
-      const idx = Math.round(el.scrollTop / itemHeight);
-      const clamped = Math.max(0, Math.min(items.length - 1, idx));
-      el.scrollTo({ top: clamped * itemHeight, behavior: 'smooth' });
-      const newItem = items[clamped];
-      if (newItem && newItem.value !== value && onChange) onChange(newItem.value);
-    }, 90);
-  };
-
-  return (
-    <div className="relative select-none" style={{ height }}>
-      <div
-        className="absolute left-0 right-0 pointer-events-none border-y-2 border-red-500/70 bg-red-50/40 z-10"
-        style={{ top: padCount * itemHeight, height: itemHeight }}
-      />
-      <div className="absolute inset-x-0 top-0 h-1/3 bg-gradient-to-b from-white to-transparent z-20 pointer-events-none" />
-      <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-white to-transparent z-20 pointer-events-none" />
-      <div
-        ref={containerRef}
-        onScroll={handleScroll}
-        className="h-full overflow-y-scroll no-scrollbar"
-        style={{ scrollSnapType: 'y mandatory' }}
-      >
-        <div style={{ height: padCount * itemHeight }} />
-        {items.map((it) => (
-          <div
-            key={it.value}
-            onClick={() => {
-              const el = containerRef.current;
-              const idx = items.findIndex(i => i.value === it.value);
-              if (el) el.scrollTo({ top: idx * itemHeight, behavior: 'smooth' });
-              if (onChange) onChange(it.value);
-            }}
-            className={`flex items-center justify-center font-black uppercase tracking-widest cursor-pointer transition-all ${it.value === value ? 'text-red-600 text-lg scale-100' : 'text-slate-300 text-sm scale-90'}`}
-            style={{ height: itemHeight, scrollSnapAlign: 'center' }}
-          >
-            {it.label}
-          </div>
-        ))}
-        <div style={{ height: padCount * itemHeight }} />
-      </div>
-    </div>
-  );
-};
-
 const Select = ({ label, options = [], name, defaultValue, value, onChange, disabled, ...props }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [selectedValue, setSelectedValue] = useState(value || defaultValue || (options[0]?.value || options[0]));
@@ -2696,24 +2621,53 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                     />
 
                     <div className="space-y-2 mb-4">
-                      <label className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 flex items-center gap-1.5">
+                      <label className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 flex items-center justify-center gap-1.5">
                         <Clock size={12} /> TIEMPO DE GARANTÍA
                       </label>
-                      <div className="flex items-stretch gap-3 p-4 bg-white rounded-2xl border-2 border-slate-100 shadow-sm">
-                        <WheelPicker
-                          items={Array.from({ length: 100 }, (_, i) => ({ value: i + 1, label: String(i + 1) }))}
-                          value={warrantyValue}
-                          onChange={setWarrantyValue}
-                        />
-                        <WheelPicker
-                          items={[
-                            { value: 'dias', label: warrantyValue === 1 ? 'Día' : 'Días' },
-                            { value: 'meses', label: warrantyValue === 1 ? 'Mes' : 'Meses' },
-                            { value: 'anos', label: warrantyValue === 1 ? 'Año' : 'Años' },
-                          ]}
-                          value={warrantyUnit}
-                          onChange={setWarrantyUnit}
-                        />
+                      <div className="flex items-center justify-center gap-2">
+                        <div className="flex items-center h-9 rounded-full border border-slate-200 bg-white shadow-sm overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => setWarrantyValue(v => Math.max(1, v - 1))}
+                            className="w-8 h-full flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-slate-50 transition-colors text-sm font-black"
+                          >
+                            −
+                          </button>
+                          <input
+                            type="number"
+                            min={1}
+                            max={100}
+                            value={warrantyValue}
+                            onChange={(e) => {
+                              const n = Number(e.target.value);
+                              setWarrantyValue(Number.isFinite(n) ? Math.min(100, Math.max(1, n)) : 1);
+                            }}
+                            className="w-9 h-full text-center bg-transparent focus:outline-none font-black text-sm text-slate-900 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setWarrantyValue(v => Math.min(100, v + 1))}
+                            className="w-8 h-full flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-slate-50 transition-colors text-sm font-black"
+                          >
+                            +
+                          </button>
+                        </div>
+                        <div className="flex items-center h-9 rounded-full border border-slate-200 bg-slate-50 p-0.5 shadow-sm">
+                          {[
+                            { value: 'dias', label: 'Días' },
+                            { value: 'meses', label: 'Meses' },
+                            { value: 'anos', label: 'Años' },
+                          ].map(opt => (
+                            <button
+                              key={opt.value}
+                              type="button"
+                              onClick={() => setWarrantyUnit(opt.value)}
+                              className={`h-full px-3 rounded-full text-[10px] font-black uppercase tracking-wide transition-all ${warrantyUnit === opt.value ? 'bg-red-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
+                            >
+                              {opt.label}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
 

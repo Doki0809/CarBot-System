@@ -725,10 +725,3 @@ button, a, input, select, textarea, [class*="transition-"] {
 .dark .bg-gray-100 {
   background-color: var(--bg-tertiary) !important;
 }
-.no-scrollbar {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
-}
-.no-scrollbar::-webkit-scrollbar {
-  display: none;
-}
