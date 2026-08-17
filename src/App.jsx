@@ -2084,7 +2084,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       const vehicle = inventory.find(v => String(v.id) === String(selectedVehicleId));
       if (!vehicle) throw new Error("Vehículo no encontrado en el inventario actual");
 
-      const warrantyUnitLabel = { dias: warrantyValue === 1 ? 'Día' : 'Días', meses: warrantyValue === 1 ? 'Mes' : 'Meses', anos: warrantyValue === 1 ? 'Año' : 'Años' }[warrantyUnit] || 'Meses';
+      const warrantyValueNum = Number(warrantyValue) || 1;
+      const warrantyUnitLabel = { dias: warrantyValueNum === 1 ? 'Día' : 'Días', meses: warrantyValueNum === 1 ? 'Mes' : 'Meses', anos: warrantyValueNum === 1 ? 'Año' : 'Años' }[warrantyUnit] || 'Meses';
 
       const cliente = {
         nombre: clientName,
@@ -2097,7 +2098,7 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
         inicial: downPayment,
         monedaVenta: priceCurrency,
         monedaInicial: inicialCurrency,
-        tiempoGarantia: `${warrantyValue} ${warrantyUnitLabel}`
+        tiempoGarantia: `${warrantyValueNum} ${warrantyUnitLabel}`
       };
 
       // GHL Location ID resolution
@@ -2628,8 +2629,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                         <div className="flex items-center h-9 rounded-full border border-slate-200 bg-white shadow-sm overflow-hidden">
                           <button
                             type="button"
-                            onClick={() => setWarrantyValue(v => Math.max(1, v - 1))}
-                            className="w-8 h-full flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-slate-50 transition-colors text-sm font-black"
+                            onClick={() => setWarrantyValue(v => Math.max(1, (Number(v) || 1) - 1))}
+                            className="w-8 h-full flex items-center justify-center text-slate-700 hover:text-red-600 hover:bg-slate-50 transition-colors text-sm font-black"
                           >
                             −
                           </button>
@@ -2637,17 +2638,20 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                             type="number"
                             min={1}
                             max={100}
-                            value={warrantyValue}
+                            value={warrantyValue === '' ? '' : warrantyValue}
                             onChange={(e) => {
-                              const n = Number(e.target.value);
-                              setWarrantyValue(Number.isFinite(n) ? Math.min(100, Math.max(1, n)) : 1);
+                              const raw = e.target.value;
+                              if (raw === '') { setWarrantyValue(''); return; }
+                              const n = Number(raw);
+                              if (Number.isFinite(n)) setWarrantyValue(Math.min(100, Math.max(0, n)));
                             }}
+                            onBlur={() => setWarrantyValue(v => (v === '' || Number(v) < 1) ? 1 : Math.min(100, Number(v)))}
                             className="w-9 h-full text-center bg-transparent focus:outline-none font-black text-sm text-slate-900 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                           />
                           <button
                             type="button"
-                            onClick={() => setWarrantyValue(v => Math.min(100, v + 1))}
-                            className="w-8 h-full flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-slate-50 transition-colors text-sm font-black"
+                            onClick={() => setWarrantyValue(v => Math.min(100, (Number(v) || 0) + 1))}
+                            className="w-8 h-full flex items-center justify-center text-slate-700 hover:text-red-600 hover:bg-slate-50 transition-colors text-sm font-black"
                           >
                             +
                           </button>
@@ -2662,7 +2666,7 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                               key={opt.value}
                               type="button"
                               onClick={() => setWarrantyUnit(opt.value)}
-                              className={`h-full px-3 rounded-full text-[10px] font-black uppercase tracking-wide transition-all ${warrantyUnit === opt.value ? 'bg-red-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
+                              className={`h-full px-3 rounded-full text-[10px] font-black uppercase tracking-wide transition-all ${warrantyUnit === opt.value ? 'bg-red-600 text-white shadow-sm' : 'text-slate-700 hover:text-slate-900'}`}
                             >
                               {opt.label}
                             </button>
