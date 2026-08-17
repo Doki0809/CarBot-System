@@ -38,6 +38,7 @@ import VinDecoderSection from './components/VinDecoderSection.jsx';
 import { mapVinToFormFields } from './utils/vinDecoder.js';
 import { fetchDealerRateConfig, resolveExchangeRate, convertAmount, getLastRateMeta, DEFAULT_PRIMARY_CURRENCY, DEFAULT_SECONDARY_CURRENCY, DEFAULT_AUTO_INITIAL_PCT } from './utils/exchangeRate.js';
 import { formatWithCommas, parseCommaNumber, cursorPosAfterFormat } from './utils/formatInput.js';
+import { loadGoogleMaps, parseGooglePlace } from './utils/googleMaps.js';
 // Heavy views loaded on demand (only when their tab/route is active) to shrink the initial bundle.
 const VehicleEditView = lazy(() => import('./VehicleEditView'));
 const ContactsView = lazy(() => import('./ContactsView'));
@@ -1813,6 +1814,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
   const [clientState, setClientState] = useState('');
   const [clientCountry, setClientCountry] = useState('');
   const [clientPostalCode, setClientPostalCode] = useState('');
+  const [mapsReady, setMapsReady] = useState(false);
+  const addressSearchRef = useRef(null);
   const [bankName, setBankName] = useState('');
   const [warrantyValue, setWarrantyValue] = useState(12);
   const [warrantyUnit, setWarrantyUnit] = useState('meses');
@@ -2054,6 +2057,38 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
       setSubmitted(false);
     }
   }, [initialVehicle, isOpen, inventory, templates]);
+
+  // Carga Google Maps (Places) al abrir el modal, para el buscador de ubicación
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    loadGoogleMaps(import.meta.env.VITE_GOOGLE_MAPS_API_KEY)
+      .then(() => { if (!cancelled) setMapsReady(true); })
+      .catch((err) => console.warn('⚠️ Google Maps no disponible:', err.message));
+    return () => { cancelled = true; };
+  }, [isOpen]);
+
+  // Engancha el Autocomplete de Google Places al input de búsqueda de dirección
+  useEffect(() => {
+    if (!mapsReady || !isOpen || !addressSearchRef.current || !window.google?.maps?.places) return;
+    const autocomplete = new window.google.maps.places.Autocomplete(addressSearchRef.current, {
+      types: ['address'],
+      componentRestrictions: { country: 'do' },
+      fields: ['address_components', 'formatted_address'],
+    });
+    const listener = autocomplete.addListener('place_changed', () => {
+      const place = autocomplete.getPlace();
+      if (!place.address_components) return;
+      const parsed = parseGooglePlace(place);
+      if (parsed.address1) setClientAddress1(parsed.address1.toUpperCase());
+      if (parsed.sector) setClientSector(parsed.sector.toUpperCase());
+      if (parsed.city) setClientCity(parsed.city.toUpperCase());
+      if (parsed.state) setClientState(parsed.state.toUpperCase());
+      if (parsed.country) setClientCountry(parsed.country.toUpperCase());
+      if (parsed.postalCode) setClientPostalCode(parsed.postalCode);
+    });
+    return () => { window.google.maps.event.removeListener(listener); };
+  }, [mapsReady, isOpen]);
 
   // When vehicle selected, auto-fill price if empty and NOT editing (or coming from contact)
   useEffect(() => {
@@ -2625,6 +2660,34 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                       error={submitted && !clientEmail ? "OBLIGATORIO" : ""}
                       required
                     />
+                  </div>
+
+                  <div className="col-span-1 sm:col-span-2 pt-2">
+                    <div
+                      className="p-[1.5px] rounded-2xl shadow-sm"
+                      style={{ background: 'linear-gradient(90deg, #4285F4, #34A853, #FBBC05, #EA4335)' }}
+                    >
+                      <div className="rounded-[15px] px-4 py-3 flex items-center gap-3" style={{ backgroundColor: 'var(--bg-elevated)' }}>
+                        <div className="shrink-0 w-9 h-9 rounded-xl flex items-center justify-center" style={{ backgroundColor: 'rgba(66, 133, 244, 0.10)' }}>
+                          <Search size={16} style={{ color: '#4285F4' }} strokeWidth={2.5} />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <label className="block text-[9px] font-black uppercase tracking-[0.2em] text-slate-400 mb-0.5">
+                            Autocompletar con Google Maps
+                          </label>
+                          <input
+                            ref={addressSearchRef}
+                            type="text"
+                            placeholder={mapsReady ? "Escribe la dirección y elige una sugerencia..." : "Cargando Google Maps..."}
+                            disabled={!mapsReady}
+                            className="w-full bg-transparent focus:outline-none font-bold text-sm text-slate-900 placeholder:text-slate-400 placeholder:font-semibold disabled:opacity-50"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-[10px] font-bold text-slate-400 mt-1.5 ml-1">
+                      Selecciona una sugerencia y se llenan solos los campos de abajo
+                    </p>
                   </div>
 
                   <div className="col-span-1 sm:col-span-2">
