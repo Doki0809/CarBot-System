@@ -11,13 +11,13 @@
 :root {
   /* Backgrounds */
   --bg-primary:    #F2F2F7;
-  --bg-secondary:  rgba(255, 255, 255, 0.72);
+  --bg-secondary:  rgba(255, 255, 255, 0.96);
   --bg-tertiary:   #E5E5EA;
   --bg-elevated:   #FFFFFF;
 
   /* Glass morphism */
-  --bg-glass:      rgba(255, 255, 255, 0.65);
-  --bg-glass-heavy: rgba(255, 255, 255, 0.85);
+  --bg-glass:      rgba(255, 255, 255, 0.96);
+  --bg-glass-heavy: rgba(255, 255, 255, 0.99);
   --border-glass:  rgba(0, 0, 0, 0.08);
   --blur-glass:    40px;
 
@@ -43,15 +43,15 @@
   --shadow-modal: 0 24px 80px rgba(0, 0, 0, 0.14), 0 8px 24px rgba(0, 0, 0, 0.06);
 
   /* Nav */
-  --nav-bg:       rgba(255, 255, 255, 0.72);
+  --nav-bg:       rgba(255, 255, 255, 0.96);
   --nav-border:   rgba(0, 0, 0, 0.06);
   --nav-active:   var(--accent);
   --nav-inactive: #8E8E93;
-  --nav-pill-bg:  rgba(255, 255, 255, 0.60);
+  --nav-pill-bg:  rgba(255, 255, 255, 0.92);
 
   /* Inputs */
-  --input-bg:     rgba(0, 0, 0, 0.03);
-  --input-border: rgba(0, 0, 0, 0.08);
+  --input-bg:     #F5F5F7;
+  --input-border: rgba(0, 0, 0, 0.10);
   --input-focus:  var(--accent);
 
   /* Misc */
