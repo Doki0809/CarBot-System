@@ -2623,7 +2623,7 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
 
                     <div className="space-y-2 mb-4">
                       <label className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 flex items-center justify-center gap-1.5">
-                        <Clock size={12} /> TIEMPO DE GARANTÍA
+                        <Clock size={12} /> {documentType === 'cotizacion' ? 'TIEMPO VÁLIDA COTIZACIÓN' : 'TIEMPO DE GARANTÍA'}
                       </label>
                       <div className="flex items-center justify-center gap-2">
                         <div className="flex items-center h-9 rounded-full border border-slate-200 bg-white shadow-sm overflow-hidden">
