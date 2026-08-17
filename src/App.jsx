@@ -2072,7 +2072,8 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
   useEffect(() => {
     if (!mapsReady || !isOpen || !addressSearchRef.current || !window.google?.maps?.places) return;
     const autocomplete = new window.google.maps.places.Autocomplete(addressSearchRef.current, {
-      types: ['address'],
+      // Sin restricción de "types": incluye direcciones Y lugares con nombre propio
+      // (residenciales, edificios, plazas) — con 'geocode' o 'address' esos no salían.
       componentRestrictions: { country: 'do' },
       fields: ['address_components', 'formatted_address'],
     });
@@ -2678,8 +2679,15 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                           <input
                             ref={addressSearchRef}
                             type="text"
+                            name="carbot-address-search-nofill"
                             placeholder={mapsReady ? "Escribe la dirección y elige una sugerencia..." : "Cargando Google Maps..."}
                             disabled={!mapsReady}
+                            autoComplete="off"
+                            autoCorrect="off"
+                            autoCapitalize="off"
+                            spellCheck="false"
+                            data-lpignore="true"
+                            data-1p-ignore="true"
                             className="w-full bg-transparent focus:outline-none font-bold text-sm text-slate-900 placeholder:text-slate-400 placeholder:font-semibold disabled:opacity-50"
                           />
                         </div>

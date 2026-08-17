@@ -465,6 +465,38 @@ input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
 [data-sileo-description].toast-desc-white { color: #ffffff !important; opacity: 0.9; }
 
 /* ──────────────────────────────────────────────────────────
+   GOOGLE PLACES AUTOCOMPLETE — dropdown a juego con el resto de la UI
+─────────────────────────────────────────────────────────── */
+.pac-container {
+  z-index: 10000 !important; /* por encima de los modales (z-[100]) */
+  margin-top: 8px;
+  border: none !important;
+  border-radius: 20px !important;
+  box-shadow: 0 20px 48px -12px rgba(0, 0, 0, 0.18), 0 8px 20px -8px rgba(0, 0, 0, 0.10) !important;
+  padding: 8px !important;
+  font-family: inherit !important;
+}
+.pac-item {
+  border: none !important;
+  border-radius: 12px !important;
+  padding: 10px 12px !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  color: #1C1C1E !important;
+  cursor: pointer;
+}
+.pac-item:hover, .pac-item-selected {
+  background-color: rgba(227, 28, 37, 0.06) !important;
+}
+.pac-icon { display: none !important; }
+.pac-item-query {
+  font-size: 13px !important;
+  font-weight: 800 !important;
+  color: #1C1C1E !important;
+}
+.pac-matched { color: #E31C25 !important; }
+
+/* ──────────────────────────────────────────────────────────
    SMOOTH THEME TRANSITION
 ─────────────────────────────────────────────────────────── */
 *, *::before, *::after {
