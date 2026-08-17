@@ -261,7 +261,7 @@ h1, h2, h3, .font-display {
     transition: all var(--transition-fast);
   }
   .glass-input::placeholder {
-    color: var(--text-tertiary);
+    color: var(--text-secondary);
   }
   .glass-input:focus {
     border-color: var(--accent);
