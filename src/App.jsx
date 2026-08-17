@@ -2630,7 +2630,7 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                   <div className="col-span-1 sm:col-span-2">
                     <Input
                       label="DIRECCIÓN POSTAL"
-                      placeholder="CALLE, NÚMERO"
+                      placeholder="EJ. AV. 25 DE FEBRERO"
                       icon={MapPin}
                       value={clientAddress1}
                       onChange={(e) => { setClientAddress1(e.target.value.toUpperCase()); }}
@@ -2638,14 +2638,14 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                   </div>
                   <Input
                     label="NUM. CASA/APARTAMENTO"
-                    placeholder="EJ. #12"
+                    placeholder="EJ. EDIF. 47 PISO 3 APTO 3-A"
                     icon={Home}
                     value={clientAptNumber}
                     onChange={(e) => { setClientAptNumber(e.target.value.toUpperCase()); }}
                   />
                   <Input
                     label="SECTOR"
-                    placeholder="EJ. PIANTINI"
+                    placeholder="EJ. ALMA ROSA"
                     icon={Compass}
                     value={clientSector}
                     onChange={(e) => { setClientSector(e.target.value.toUpperCase()); }}
@@ -2666,7 +2666,7 @@ const GenerateContractModal = ({ isOpen, onClose, inventory, onGenerate, templat
                   />
                   <Input
                     label="PAÍS"
-                    placeholder="REPÚBLICA DOMINICANA"
+                    placeholder="EJ. REP. DOM."
                     icon={Globe}
                     value={clientCountry}
                     onChange={(e) => { setClientCountry(e.target.value.toUpperCase()); }}
