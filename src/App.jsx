@@ -8191,12 +8191,12 @@ export default function CarbotApp() {
     };
     if (type === 'error') {
       // Fondo rojo + texto blanco
-      sileo.error({ title: titles.error, fill: '#dc2626', roundness: 16, styles: { title: 'toast-title-white', badge: 'toast-badge-white' } });
+      sileo.error({ title: titles.error, description: message, fill: '#dc2626', roundness: 16, styles: { title: 'toast-title-white', description: 'toast-desc-white', badge: 'toast-badge-white' } });
     } else if (type === 'warning') {
-      sileo.warning({ title: titles.warning, fill: '#f59e0b', roundness: 16, styles: { title: 'toast-title-white', badge: 'toast-badge-white' } });
+      sileo.warning({ title: titles.warning, description: message, fill: '#f59e0b', roundness: 16, styles: { title: 'toast-title-white', description: 'toast-desc-white', badge: 'toast-badge-white' } });
     } else {
       // Fondo blanco + "Listo" en verde agradable
-      sileo.success({ title: titles.success, fill: '#ffffff', roundness: 16, styles: { title: 'toast-title-green', badge: 'toast-badge-green' } });
+      sileo.success({ title: titles.success, description: message, fill: '#ffffff', roundness: 16, styles: { title: 'toast-title-green', description: 'toast-desc-green', badge: 'toast-badge-green' } });
     }
   };
 

@@ -460,6 +460,9 @@ input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
 /* Badge (ícono): verde más agradable en éxito, blanco en error/aviso */
 [data-sileo-badge].toast-badge-green { --sileo-tone: #15a34a !important; color: #15a34a !important; }
 [data-sileo-badge].toast-badge-white { --sileo-tone: #ffffff !important; color: #ffffff !important; }
+/* Descripción del toast: mismo color que el título, algo más tenue */
+[data-sileo-description].toast-desc-green { color: #15a34a !important; opacity: 0.85; }
+[data-sileo-description].toast-desc-white { color: #ffffff !important; opacity: 0.9; }
 
 /* ──────────────────────────────────────────────────────────
    SMOOTH THEME TRANSITION
