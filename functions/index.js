@@ -3799,7 +3799,8 @@ exports.apiGHL = onRequest({ cors: true, secrets: [ghlClientSecret, ghlClientId,
       // Ubicación (custom fields, no estándar — address1/city/state/country/postalCode
       // ya van directo en el root del contacto vía cleanContactData)
       { keys: ["num_casaapartamento", "num_casa_apartamento"], value: getFrontendCf('num_casaapartamento') || "" },
-      { keys: ["sector"], value: getFrontendCf('sector') || "" }
+      { keys: ["sector"], value: getFrontendCf('sector') || "" },
+      { keys: ["pais"], value: getFrontendCf('pais') || "" }
     ];
 
     // Construir el array final buscando dinámicamente los IDs en la cuenta de GHL actual (Multi-Tenant)

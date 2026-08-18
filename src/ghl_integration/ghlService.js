@@ -119,6 +119,9 @@ export const prepararPayloadGHL = (cliente, vehiculo, locationId) => {
             // 4.1 Ubicación (campos personalizados, no estándar de GHL)
             { id: "num_casaapartamento", key: "num_casaapartamento", value: (cliente.aptNumber || "").toUpperCase() },
             { id: "sector", key: "sector", value: (cliente.sector || "").toUpperCase() },
+            // "pais" es texto libre para mostrar en documentos (ej. "REP. DOM.");
+            // el campo estándar "country" de GHL exige código ISO y se resuelve aparte.
+            { id: "pais", key: "pais", value: (cliente.country || "").toUpperCase() },
 
             // 5. Otros datos
             { id: "a_quien_va_dirigida", key: "a_quien_va_dirigida", value: `${cliente.nombre || ''} ${cliente.apellido || ''}`.trim().toUpperCase() },
