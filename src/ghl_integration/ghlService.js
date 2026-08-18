@@ -142,7 +142,17 @@ export const prepararPayloadGHL = (cliente, vehiculo, locationId) => {
     if (cliente.address1 && cliente.address1.trim()) payload.address1 = cliente.address1.trim();
     if (cliente.city && cliente.city.trim()) payload.city = cliente.city.trim();
     if (cliente.state && cliente.state.trim()) payload.state = cliente.state.trim();
-    if (cliente.country && cliente.country.trim()) payload.country = cliente.country.trim();
+    // El campo estándar "country" de GHL exige código ISO 3166-1 alpha-2 (ej. "DO"),
+    // no acepta texto libre como "REPÚBLICA DOMINICANA" — GHL responde 400
+    // "country must be valid" y no se genera el documento. Resolvemos el texto
+    // que escribe el usuario (o el que trae Google Places) al código correcto.
+    const COUNTRY_ISO_MAP = {
+        'REPUBLICA DOMINICANA': 'DO', 'REPÚBLICA DOMINICANA': 'DO',
+        'REP. DOM.': 'DO', 'REP DOM': 'DO', 'REP. DOM': 'DO',
+        'DOMINICAN REPUBLIC': 'DO', 'DO': 'DO',
+    };
+    const countryInput = (cliente.country || '').trim().toUpperCase();
+    payload.country = COUNTRY_ISO_MAP[countryInput] || 'DO';
     if (cliente.postalCode && String(cliente.postalCode).trim()) payload.postalCode = String(cliente.postalCode).trim();
 
     return payload;
