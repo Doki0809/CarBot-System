@@ -106,7 +106,14 @@ export const getExportableVehicles = (inventory = []) =>
 
 const slug = (s) => text(s).replace(/[^\w\sáéíóúñÁÉÍÓÚÑ-]/g, '').replace(/\s+/g, '_') || 'Dealer';
 
+// Fecha de descarga: larga para mostrar, corta (YYYY-MM-DD) para el nombre del archivo.
 const today = () => new Date().toLocaleDateString('es-DO', { day: '2-digit', month: 'long', year: 'numeric' });
+
+const todayStamp = () => {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
 
 // ── CSV ──────────────────────────────────────────────────────────────
 export const exportInventoryCSV = (inventory, dealerName) => {
@@ -118,9 +125,12 @@ export const exportInventoryCSV = (inventory, dealerName) => {
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
 
+  // Se agrega la fecha de descarga como última columna, repetida en cada fila,
+  // para no romper el parseo de la cabecera en Excel/Sheets.
+  const stamp = today();
   const csv = [
-    EXPORT_COLUMNS.map(c => escape(c.label)).join(','),
-    ...rows.map(r => EXPORT_COLUMNS.map(c => escape(r[c.key])).join(',')),
+    [...EXPORT_COLUMNS.map(c => escape(c.label)), escape('Fecha de descarga')].join(','),
+    ...rows.map(r => [...EXPORT_COLUMNS.map(c => escape(r[c.key])), escape(stamp)].join(',')),
   ].join('\n');
 
   // BOM para que Excel respete los acentos
@@ -128,7 +138,7 @@ export const exportInventoryCSV = (inventory, dealerName) => {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `Inventario_${slug(dealerName)}.csv`;
+  a.download = `Inventario_${slug(dealerName)}_${todayStamp()}.csv`;
   a.click();
   URL.revokeObjectURL(url);
   return rows.length;
@@ -224,7 +234,7 @@ export const buildInventoryPdfHtml = (rows, dealer = {}) => {
           </td>
           <td style="text-align:right;vertical-align:middle;font-size:8.5px;color:#64748b;line-height:1.6;">
             ${dealerLines.map(l => `<div>${esc(l)}</div>`).join('')}
-            <div style="margin-top:3px;font-weight:700;color:#94a3b8;">${esc(today())}</div>
+            <div style="margin-top:3px;font-weight:700;color:#94a3b8;">Descargado: ${esc(today())}</div>
           </td>
         </tr>
       </table>
@@ -249,7 +259,7 @@ export const exportInventoryPDF = async (inventory, dealer = {}) => {
     const html2pdf = (await import('html2pdf.js')).default;
     await html2pdf().set({
       margin: [0.4, 0.4, 0.5, 0.4],
-      filename: `Inventario_${slug(dealer.name)}.pdf`,
+      filename: `Inventario_${slug(dealer.name)}_${todayStamp()}.pdf`,
       image: { type: 'jpeg', quality: 0.98 },
       html2canvas: { scale: 2, useCORS: true, letterRendering: true },
       jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' },
