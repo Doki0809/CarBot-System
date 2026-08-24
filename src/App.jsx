@@ -427,9 +427,16 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
   // % de inicial propio de ESTA unidad. null = hereda el % global de Ajustes
   // (y el recálculo masivo puede tocarlo); un número lo desliga del global, de
   // modo que cambiar el % general ya no afecta este vehículo.
+  // Puede valer: null (usa el global), '' (la casilla quedó vacía mientras el
+  // dealer escribe) o un número. El '' es necesario porque Number('') es 0 —
+  // sin ese estado, borrar la casilla escribía un 0 al instante y el siguiente
+  // dígito quedaba pegado detrás ("0100").
   const [customInitialPct, setCustomInitialPct] = useState(null);
   const globalInitialPct = rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT;
-  const effectiveInitialPct = customInitialPct ?? globalInitialPct;
+  const hasCustomInitialPct = customInitialPct !== null && customInitialPct !== '';
+  const effectiveInitialPct = hasCustomInitialPct ? Number(customInitialPct) : globalInitialPct;
+  // Lo que se ve en la casilla: respeta el vacío en vez de forzar un 0.
+  const initialPctInputValue = customInitialPct === '' ? '' : effectiveInitialPct;
 
   // Recalcula el inicial en cuanto llega/cambia la config de tasa+% — no solo
   // cuando el usuario retipea el precio. Sin esto, reabrir un vehículo después
@@ -738,7 +745,8 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     data.inicial_automatico = !leaveInitialEmpty && !initialManuallyEditedRef.current;
     // null = sigue el % global; número = % propio de esta unidad, que la excluye
     // del recálculo masivo cuando se cambia el % general en Ajustes.
-    data.porcentaje_inicial = customInitialPct;
+    // '' (casilla vacía al guardar sin salir del campo) cuenta como "sin % propio".
+    data.porcentaje_inicial = hasCustomInitialPct ? Number(customInitialPct) : null;
     delete data.initial_unified;
 
     // --- MILLAJE ---
@@ -1178,7 +1186,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                         <label className="block text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">
                           % Inicial de este vehículo
                         </label>
-                        {customInitialPct !== null && (
+                        {hasCustomInitialPct && (
                           <button
                             type="button"
                             disabled={isLocked}
@@ -1207,20 +1215,33 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                         <div className="flex items-center gap-0.5 px-2 py-1.5 rounded-lg shrink-0 bg-white border border-slate-200">
                           <input
                             type="number" min="0" max="100" step="1"
-                            value={effectiveInitialPct}
+                            value={initialPctInputValue}
                             disabled={isLocked}
                             onChange={(e) => {
-                              const n = Number(e.target.value);
+                              const raw = e.target.value;
                               initialManuallyEditedRef.current = false;
-                              setCustomInitialPct(isNaN(n) ? 0 : Math.min(100, Math.max(0, n)));
+                              // Se permite quedar vacío mientras se escribe; el
+                              // clamp corre al salir del campo.
+                              if (raw === '') { setCustomInitialPct(''); return; }
+                              const n = Number(raw);
+                              if (!Number.isFinite(n)) return;
+                              setCustomInitialPct(Math.min(100, Math.max(0, n)));
                             }}
-                            className="w-8 bg-transparent text-xs font-black text-right outline-none text-slate-800"
+                            onBlur={() => {
+                              // Casilla vacía al salir = "no le pongas % propio",
+                              // así que vuelve a heredar el general (y la casilla
+                              // vuelve a mostrar ese número en vez de quedar en
+                              // blanco). Actualización funcional para no depender
+                              // del valor capturado en el render del handler.
+                              setCustomInitialPct(prev => (prev === '' ? null : prev));
+                            }}
+                            className="w-10 bg-transparent text-xs font-black text-right outline-none text-slate-800"
                           />
                           <span className="text-xs font-black text-slate-400">%</span>
                         </div>
                       </div>
                       <p className="text-[9px] font-bold mt-1.5 ml-1 text-slate-400">
-                        {customInitialPct === null
+                        {!hasCustomInitialPct
                           ? `Siguiendo el ${globalInitialPct}% general de Ajustes.`
                           : `Solo para este vehículo. El ${globalInitialPct}% general no lo afecta.`}
                       </p>
