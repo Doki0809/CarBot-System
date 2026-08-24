@@ -424,6 +424,13 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     return () => { cancelled = true; };
   }, [userProfile?.supabaseDealerId, userProfile?.dealerId, isOpen]);
 
+  // % de inicial propio de ESTA unidad. null = hereda el % global de Ajustes
+  // (y el recálculo masivo puede tocarlo); un número lo desliga del global, de
+  // modo que cambiar el % general ya no afecta este vehículo.
+  const [customInitialPct, setCustomInitialPct] = useState(null);
+  const globalInitialPct = rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT;
+  const effectiveInitialPct = customInitialPct ?? globalInitialPct;
+
   // Recalcula el inicial en cuanto llega/cambia la config de tasa+% — no solo
   // cuando el usuario retipea el precio. Sin esto, reabrir un vehículo después
   // de cambiar el % en Ajustes seguía mostrando el inicial calculado con el %
@@ -432,13 +439,13 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     if (!rateConfig || leaveInitialEmpty || initialManuallyEditedRef.current) return;
     const priceNum = Number(prices.price) || 0;
     if (priceNum <= 0) return;
-    const autoPct = (rateConfig.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+    const autoPct = effectiveInitialPct / 100;
     const priceInPrimary = convertAmount(priceNum, currency, rateConfig.primary, rateConfig.ratesToPrimary);
     const recalculated = String(Math.round(priceInPrimary * autoPct));
     if (recalculated !== prices.initial) setPrices(prev => ({ ...prev, initial: recalculated }));
     if (downPaymentCurrency !== rateConfig.primary) setDownPaymentCurrency(rateConfig.primary);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rateConfig]);
+  }, [rateConfig, effectiveInitialPct]);
 
   // Text inputs that can be filled by VIN decoder via DOM
   const VIN_TEXT_INPUTS = ['make', 'model', 'year', 'edition', 'vin', 'engine_cyl', 'engine_cc'];
@@ -529,6 +536,11 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       // Si ya tiene precio guardado pero nunca se le puso inicial, asumimos que se
       // dejó vacío a propósito la vez anterior — mostrar el checkbox ya marcado.
       setLeaveInitialEmpty(!hasRealInitial && hasRealPrice);
+      setCustomInitialPct(
+        initialData.porcentaje_inicial === null || initialData.porcentaje_inicial === undefined
+          ? null
+          : Number(initialData.porcentaje_inicial)
+      );
       setStatus(initialData.status || initialData.estado || 'available');
       setLinkExterno(initialData.detalles?.link_externo || initialData.link_externo || '');
 
@@ -547,6 +559,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       setPrices({ price: '', initial: '' });
       initialManuallyEditedRef.current = false;
       setLeaveInitialEmpty(false);
+      setCustomInitialPct(null);
     }
   }, [initialData, isOpen]);
 
@@ -711,7 +724,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     let initialValue = Number(prices.initial) || 0;
     let finalDownPaymentCurrency = downPaymentCurrency;
     if (!leaveInitialEmpty && initialValue <= 0 && priceValue > 0) {
-      const autoPct = (rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+      const autoPct = effectiveInitialPct / 100;
       if (rateConfig) {
         const priceInPrimary = convertAmount(priceValue, currency, rateConfig.primary, rateConfig.ratesToPrimary);
         initialValue = Math.round(priceInPrimary * autoPct);
@@ -723,6 +736,9 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     data.initial_payment = initialValue;
     data.downPaymentCurrency = finalDownPaymentCurrency;
     data.inicial_automatico = !leaveInitialEmpty && !initialManuallyEditedRef.current;
+    // null = sigue el % global; número = % propio de esta unidad, que la excluye
+    // del recálculo masivo cuando se cambia el % general en Ajustes.
+    data.porcentaje_inicial = customInitialPct;
     delete data.initial_unified;
 
     // --- MILLAJE ---
@@ -1049,7 +1065,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                         // del dealer (aunque el precio esté en otra) — se convierte primero
                         // con la tasa y luego se saca el % configurado, marcado en esa moneda.
                         let autoInitial = '';
-                        const autoPct = (rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+                        const autoPct = effectiveInitialPct / 100;
                         if (!leaveInitialEmpty && !initialManuallyEditedRef.current && priceNum > 0) {
                           if (rateConfig) {
                             const priceInPrimary = convertAmount(priceNum, currency, rateConfig.primary, rateConfig.ratesToPrimary);
@@ -1136,7 +1152,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                           setPrices(prev => ({ ...prev, initial: '' }));
                         } else {
                           initialManuallyEditedRef.current = false;
-                          const autoPct = (rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT) / 100;
+                          const autoPct = effectiveInitialPct / 100;
                           setPrices(prev => {
                             if (prev.initial) return prev;
                             const priceNum = Number(prev.price) || 0;
@@ -1154,6 +1170,62 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                     />
                     <span className="text-[10px] font-bold text-slate-400">¿Dejar el inicial vacío?</span>
                   </label>
+
+                  {/* % DE INICIAL SOLO PARA ESTE VEHÍCULO */}
+                  {!leaveInitialEmpty && (
+                    <div className="mt-3 pt-3 border-t border-slate-100">
+                      <div className="flex items-center justify-between mb-1.5 ml-1 gap-2">
+                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">
+                          % Inicial de este vehículo
+                        </label>
+                        {customInitialPct !== null && (
+                          <button
+                            type="button"
+                            disabled={isLocked}
+                            onClick={() => {
+                              setCustomInitialPct(null);
+                              initialManuallyEditedRef.current = false;
+                            }}
+                            className="text-[9px] font-black uppercase tracking-wide text-slate-400 hover:text-red-600 transition-colors shrink-0"
+                          >
+                            Usar general
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range" min="0" max="100" step="1"
+                          value={effectiveInitialPct}
+                          disabled={isLocked}
+                          onChange={(e) => {
+                            initialManuallyEditedRef.current = false;
+                            setCustomInitialPct(Number(e.target.value));
+                          }}
+                          className="flex-1 min-w-0"
+                          style={{ accentColor: 'var(--accent)' }}
+                        />
+                        <div className="flex items-center gap-0.5 px-2 py-1.5 rounded-lg shrink-0 bg-white border border-slate-200">
+                          <input
+                            type="number" min="0" max="100" step="1"
+                            value={effectiveInitialPct}
+                            disabled={isLocked}
+                            onChange={(e) => {
+                              const n = Number(e.target.value);
+                              initialManuallyEditedRef.current = false;
+                              setCustomInitialPct(isNaN(n) ? 0 : Math.min(100, Math.max(0, n)));
+                            }}
+                            className="w-8 bg-transparent text-xs font-black text-right outline-none text-slate-800"
+                          />
+                          <span className="text-xs font-black text-slate-400">%</span>
+                        </div>
+                      </div>
+                      <p className="text-[9px] font-bold mt-1.5 ml-1 text-slate-400">
+                        {customInitialPct === null
+                          ? `Siguiendo el ${globalInitialPct}% general de Ajustes.`
+                          : `Solo para este vehículo. El ${globalInitialPct}% general no lo afecta.`}
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {/* ESTADO */}
@@ -4997,11 +5069,15 @@ const CurrencyPairCard = ({ CURR_MAP, CURR_CODES, selectedCurrencies, setPrimary
       // Elegibles: los ya marcados como automáticos, más los heredados sin marca
       // que están vacíos (nunca tuvieron un inicial escrito por el dealer). Un
       // inicial con valor y sin marca se considera manual y no se toca.
+      // Además se excluyen los que tienen un % propio (porcentaje_inicial no
+      // nulo): ese vehículo se desligó del % global a propósito y cambiar el
+      // general no debe pisarlo.
       const { data: rows, error: fetchErr } = await supabase
         .from('vehiculos')
         .select('id, precio, moneda_precio, inicial, inicial_automatico')
         .eq('dealer_id', dealerId)
         .is('deleted_at', null)
+        .is('porcentaje_inicial', null)
         .gt('precio', 0)
         .or('inicial_automatico.is.true,and(inicial_automatico.is.null,inicial.is.null),and(inicial_automatico.is.null,inicial.eq.0)');
       if (fetchErr) throw fetchErr;
@@ -9901,6 +9977,13 @@ export default function CarbotApp() {
         // recalcular en bloque desde Ajustes cuando el dealer cambia el % o la
         // tasa, sin arriesgar pisar un inicial real que el dealer tecleó.
         inicial_automatico: typeof vehicleData.inicial_automatico === 'boolean' ? vehicleData.inicial_automatico : (existingRecord?.inicial_automatico ?? null),
+        // % de inicial propio de esta unidad. null = sigue atado al % global del
+        // dealer (y el recálculo masivo de Ajustes puede tocarlo); un número lo
+        // deja fuera de ese recálculo. Se respeta null explícito para poder
+        // volver a atarlo al global.
+        porcentaje_inicial: Object.prototype.hasOwnProperty.call(vehicleData, 'porcentaje_inicial')
+          ? (vehicleData.porcentaje_inicial === null || vehicleData.porcentaje_inicial === '' ? null : Number(vehicleData.porcentaje_inicial))
+          : (existingRecord?.porcentaje_inicial ?? null),
         millas: pickNum(vehicleData.millas, vehicleData.mileage, existingRecord?.millas),
         cantidad_asientos: parseInt(pick(vehicleData.cantidad_asientos, vehicleData.seats, existingRecord?.cantidad_asientos) || 0),
 

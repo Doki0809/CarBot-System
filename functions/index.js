@@ -5399,7 +5399,7 @@ exports.recalcInicialesDiario = onSchedule(
 
       const { data: rows, error: vErr } = await supa
         .from("vehiculos")
-        .select("id, precio, moneda_precio")
+        .select("id, precio, moneda_precio, porcentaje_inicial")
         .eq("dealer_id", dealer.id)
         .eq("inicial_automatico", true)
         .is("deleted_at", null)
@@ -5416,9 +5416,14 @@ exports.recalcInicialesDiario = onSchedule(
         // amount * (primary por USD) / (moneda origen por USD) = amount en primary
         const priceInPrimary = (Number(v.precio) * perUsd[primary]) / from;
         if (!(priceInPrimary > 0)) continue;
+        // Un vehículo con % propio sigue siguiendo la tasa del día (si no, su
+        // inicial quedaría congelado), pero con SU porcentaje, no el global.
+        const vehiclePct = v.porcentaje_inicial === null || v.porcentaje_inicial === undefined
+          ? pct
+          : Number(v.porcentaje_inicial) / 100;
         const { error: uErr } = await supa
           .from("vehiculos")
-          .update({ inicial: Math.round(priceInPrimary * pct), moneda_inicial: primary })
+          .update({ inicial: Math.round(priceInPrimary * vehiclePct), moneda_inicial: primary })
           .eq("id", v.id);
         if (!uErr) ok++;
       }
