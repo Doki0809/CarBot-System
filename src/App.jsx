@@ -39,6 +39,7 @@ import { mapVinToFormFields } from './utils/vinDecoder.js';
 import { fetchDealerRateConfig, resolveExchangeRate, convertAmount, getLastRateMeta, DEFAULT_PRIMARY_CURRENCY, DEFAULT_SECONDARY_CURRENCY, DEFAULT_AUTO_INITIAL_PCT } from './utils/exchangeRate.js';
 import { formatWithCommas, parseCommaNumber, cursorPosAfterFormat } from './utils/formatInput.js';
 import { loadGoogleMaps, parseGooglePlace } from './utils/googleMaps.js';
+import { getExportableVehicles, exportInventoryCSV, exportInventoryPDF } from './utils/inventoryExport.js';
 // Heavy views loaded on demand (only when their tab/route is active) to shrink the initial bundle.
 const VehicleEditView = lazy(() => import('./VehicleEditView'));
 const ContactsView = lazy(() => import('./ContactsView'));
@@ -6220,6 +6221,101 @@ const ImportInventoryModal = ({ isOpen, onClose, onSave, userProfile, resolvedDe
   );
 };
 
+const ExportInventoryModal = ({ isOpen, onClose, inventory, userProfile, showToast }) => {
+  const [busy, setBusy] = useState(null); // 'csv' | 'pdf'
+
+  const total = useMemo(() => (isOpen ? getExportableVehicles(inventory).length : 0), [isOpen, inventory]);
+
+  if (!isOpen) return null;
+
+  const dealerName = (new URLSearchParams(window.location.search).get('location_name') || userProfile?.dealerName || 'Mi Dealer').trim().replace(/[*_~\`]/g, '');
+
+  const handleExport = async (format) => {
+    if (busy) return;
+    if (total === 0) {
+      showToast('No hay vehículos disponibles para exportar.', 'warning');
+      return;
+    }
+    setBusy(format);
+    try {
+      if (format === 'csv') {
+        exportInventoryCSV(inventory, dealerName);
+      } else {
+        await exportInventoryPDF(inventory, {
+          name: dealerName,
+          logo: userProfile?.dealer_logo || '',
+          address: userProfile?.dealer_address || '',
+          phone: userProfile?.dealer_phone || '',
+          website: userProfile?.dealer_website || '',
+        });
+      }
+      showToast(`Inventario de ${total} vehículo(s) descargado en ${format.toUpperCase()}`);
+      onClose();
+    } catch (err) {
+      console.error('Error exportando inventario:', err);
+      showToast(`No se pudo generar el archivo: ${err.message || 'error desconocido'}`, 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const options = [
+    { id: 'pdf', icon: FileText, title: 'PDF', desc: 'Catálogo ordenado por marca y modelo, con los datos del dealer.' },
+    { id: 'csv', icon: FileSpreadsheet, title: 'CSV', desc: 'Hoja de cálculo con todos los detalles en columnas (Excel, Sheets).' },
+  ];
+
+  return (
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}>
+      <div className="w-full max-w-md rounded-3xl shadow-2xl overflow-hidden" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-glass)' }}>
+        <div className="flex items-center justify-between px-6 py-5 border-b" style={{ borderColor: 'var(--border-glass)' }}>
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl flex items-center justify-center bg-red-600">
+              <Download size={18} className="text-white" />
+            </div>
+            <div>
+              <h2 className="text-sm font-black uppercase tracking-[0.15em]" style={{ color: 'var(--text-primary)' }}>Descargar Inventario</h2>
+              <p className="text-[11px] font-semibold" style={{ color: 'var(--text-secondary)' }}>
+                {total} {total === 1 ? 'vehículo en existencia' : 'vehículos en existencia'}
+              </p>
+            </div>
+          </div>
+          <button onClick={onClose} disabled={!!busy} className="p-2 rounded-xl transition-colors hover:bg-black/5 disabled:opacity-40" style={{ color: 'var(--text-tertiary)' }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-3">
+          {options.map(opt => (
+            <button
+              key={opt.id}
+              onClick={() => handleExport(opt.id)}
+              disabled={!!busy || total === 0}
+              className="w-full flex items-center gap-4 p-4 rounded-2xl text-left transition-all hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 disabled:hover:scale-100"
+              style={{ background: 'var(--input-bg)', border: '1px solid var(--border-glass)' }}
+            >
+              <div className="w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: 'rgba(227,28,37,0.10)' }}>
+                {busy === opt.id
+                  ? <Loader2 size={20} className="animate-spin text-red-600" />
+                  : <opt.icon size={20} className="text-red-600" />}
+              </div>
+              <div className="min-w-0">
+                <div className="text-sm font-black" style={{ color: 'var(--text-primary)' }}>
+                  {busy === opt.id ? 'Generando...' : opt.title}
+                </div>
+                <div className="text-[11px] font-semibold leading-snug mt-0.5" style={{ color: 'var(--text-secondary)' }}>{opt.desc}</div>
+              </div>
+            </button>
+          ))}
+
+          <p className="text-[10px] font-semibold leading-relaxed pt-1" style={{ color: 'var(--text-tertiary)' }}>
+            Incluye las unidades disponibles y cotizadas. El archivo no muestra el estado de cada vehículo.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], showToast, onGenerateContract, onGenerateQuote, onVehicleSelect, onSellQuoted, onSave, onDelete, onDeleteQuote, onRedoSale, activeTab, setActiveTab, userProfile, searchTerm, requestConfirmation, templates = [], resolvedDealerId, isLoading, readOnly, ghlContacts = [] }) => {
   const { t } = useI18n();
   const { formatVehiclePrice, formatPrice, selected: selectedCurrencies } = useCurrency();
@@ -6232,6 +6328,7 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
   const [currentVehicle, setCurrentVehicle] = useState(null);
   const [openMenuId, setOpenMenuId] = useState(null);
   const [showImportModal, setShowImportModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
   const headerMenuRef = React.useRef(null);
 
@@ -6494,6 +6591,14 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
                   >
                     <UploadCloud size={16} className="text-red-500 flex-shrink-0" />
                     Importar Inventario
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setShowHeaderMenu(false); setShowExportModal(true); }}
+                    className="flex items-center gap-3 w-full px-4 py-3 text-sm font-semibold text-left transition-colors hover:bg-red-50 dark:hover:bg-red-950/30"
+                    style={{ color: 'var(--text-primary)', borderTop: '1px solid var(--border-glass)' }}
+                  >
+                    <Download size={16} className="text-red-500 flex-shrink-0" />
+                    Descargar Inventario
                   </button>
                 </div>
               )}
@@ -6887,6 +6992,16 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
           onSave={onSave}
           userProfile={userProfile}
           resolvedDealerId={resolvedDealerId}
+          showToast={showToast}
+        />,
+        document.body
+      )}
+      {showExportModal && createPortal(
+        <ExportInventoryModal
+          isOpen={showExportModal}
+          onClose={() => setShowExportModal(false)}
+          inventory={inventory}
+          userProfile={userProfile}
           showToast={showToast}
         />,
         document.body
@@ -8872,7 +8987,7 @@ export default function CarbotApp() {
               try {
                 const { data: selectedDealer } = await supabase
                   .from('dealers')
-                  .select('id, nombre, logo_url, address, website, ghl_location_id, id_busqueda, has_bot, bot_name, catalogo_url')
+                  .select('id, nombre, logo_url, address, website, phone, ghl_location_id, id_busqueda, has_bot, bot_name, catalogo_url')
                   .eq('id', manualSelectedDealerId)
                   .maybeSingle();
 
@@ -8893,6 +9008,7 @@ export default function CarbotApp() {
                     dealer_logo: selectedDealer.logo_url || '',
                     dealer_address: selectedDealer.address || '',
                     dealer_website: selectedDealer.website || '',
+                    dealer_phone: selectedDealer.phone || '',
                     id_busqueda: selectedDealer.id_busqueda || '',
                     has_bot: selectedDealer.has_bot || false,
                     bot_name: selectedDealer.bot_name || null,
@@ -9058,7 +9174,7 @@ export default function CarbotApp() {
               if (queryCol && queryVal) {
                 const { data: dealerData } = await supabase
                   .from('dealers')
-                  .select('id, nombre, logo_url, address, website, ghl_location_id, id_busqueda, has_bot, bot_name, catalogo_url')
+                  .select('id, nombre, logo_url, address, website, phone, ghl_location_id, id_busqueda, has_bot, bot_name, catalogo_url')
                   .eq(queryCol, queryVal)
                   .maybeSingle();
 
@@ -9067,6 +9183,7 @@ export default function CarbotApp() {
                   profileData.dealer_logo = dealerData.logo_url || '';
                   profileData.dealer_address = dealerData.address || '';
                   profileData.dealer_website = dealerData.website || '';
+                  profileData.dealer_phone = dealerData.phone || '';
                   profileData.supabaseDealerId = dealerData.id;
                   profileData.id_busqueda = dealerData.id_busqueda || '';
                   profileData.catalogo_url = dealerData.catalogo_url || '';
