@@ -145,11 +145,26 @@ export const exportInventoryCSV = (inventory, dealerName) => {
 };
 
 // ── PDF ──────────────────────────────────────────────────────────────
-const esc = (s) => String(s ?? '')
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// Se dibuja con jsPDF en texto vectorial, NO con html2canvas: ese
+// rasterizaba la página a imagen, y por eso el PDF se veía como una foto
+// (borroso al acercar, imposible de seleccionar/buscar) y cortaba el
+// contenido a la mitad al paginar.
 
-// Campos que se muestran como "chips" de detalle debajo de cada unidad.
-const DETAIL_CHIPS = [
+// Medidas en puntos (72 pt = 1 pulgada). Carta = 612 x 792.
+const PAGE = { w: 612, h: 792, mL: 40, mR: 40, mT: 40, mB: 48 };
+const CONTENT_W = PAGE.w - PAGE.mL - PAGE.mR;
+
+const COLOR = {
+  red:    [220, 38, 38],
+  dark:   [15, 23, 42],
+  value:  [30, 41, 59],
+  label:  [148, 163, 184],
+  border: [226, 232, 240],
+  muted:  [100, 116, 139],
+};
+
+// Campos que se listan dentro de cada unidad.
+const DETAIL_FIELDS = [
   ['anio', 'Año'], ['color', 'Color'], ['millaje', 'Millaje'], ['tipo', 'Tipo'],
   ['transmision', 'Transmisión'], ['combustible', 'Combustible'], ['motor', 'Motor'],
   ['traccion', 'Tracción'], ['techo', 'Techo'], ['asientos_material', 'Asientos'],
@@ -159,114 +174,231 @@ const DETAIL_CHIPS = [
   ['baul_electrico', 'Baúl eléct.'], ['vidrios_electricos', 'Vidrios eléct.'],
 ];
 
-export const buildInventoryPdfHtml = (rows, dealer = {}) => {
-  const byBrand = rows.reduce((acc, r) => {
-    (acc[r.marca] ||= []).push(r);
-    return acc;
-  }, {});
+const CARD = { padX: 12, padY: 11, titleH: 20, colGap: 8, rowH: 23, cols: 4, gapBelow: 9 };
+const BRAND = { headerH: 26, gapBelow: 10, gapAbove: 14 };
 
-  const brands = Object.keys(byBrand).sort((a, b) => a.localeCompare(b, 'es'));
+const cardChips = (u) => DETAIL_FIELDS.filter(([key]) => text(u[key]) !== '');
 
-  const dealerLines = [dealer.address, dealer.phone, dealer.website]
-    .map(text).filter(Boolean);
+const cardHeight = (u) => {
+  const rows = Math.ceil(cardChips(u).length / CARD.cols);
+  return CARD.padY * 2 + CARD.titleH + rows * CARD.rowH;
+};
 
-  const brandSections = brands.map(brand => {
-    const units = byBrand[brand];
-    const cards = units.map(u => {
-      const chips = DETAIL_CHIPS
-        .filter(([key]) => text(u[key]))
-        .map(([key, label]) => `
-          <td style="width:25%;padding:3px 10px 3px 0;vertical-align:top;">
-            <div style="font-size:7px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;">${esc(label)}</div>
-            <div style="font-size:9px;font-weight:600;color:#1e293b;word-break:break-word;">${esc(u[key])}</div>
-          </td>`);
+const setColor = (doc, c) => doc.setTextColor(c[0], c[1], c[2]);
 
-      // 4 chips por fila para que quepan en el ancho de la página; la última
-      // fila se rellena con celdas vacías para no romper el layout fijo.
-      const chipRows = [];
-      for (let i = 0; i < chips.length; i += 4) {
-        const slice = chips.slice(i, i + 4);
-        const padding = '<td style="width:25%;"></td>'.repeat(4 - slice.length);
-        chipRows.push(`<tr>${slice.join('')}${padding}</tr>`);
-      }
+// Recorta el texto para que nunca se salga de su columna.
+const fit = (doc, str, maxW) => {
+  let s = String(str ?? '');
+  if (doc.getTextWidth(s) <= maxW) return s;
+  while (s.length > 1 && doc.getTextWidth(s + '…') > maxW) s = s.slice(0, -1);
+  return s + '…';
+};
 
-      return `
-        <div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:8px;page-break-inside:avoid;">
-          <table style="width:100%;border-collapse:collapse;margin-bottom:6px;">
-            <tr>
-              <td style="font-size:13px;font-weight:800;color:#0f172a;">
-                ${esc(u.modelo)}${u.edicion ? ` <span style="font-weight:600;color:#64748b;">${esc(u.edicion)}</span>` : ''}
-              </td>
-              <td style="text-align:right;white-space:nowrap;">
-                <span style="font-size:13px;font-weight:800;color:#dc2626;">${esc(u.precio || '—')}</span>
-                ${u.inicial ? `<div style="font-size:8px;font-weight:600;color:#64748b;">Inicial: ${esc(u.inicial)}</div>` : ''}
-              </td>
-            </tr>
-          </table>
-          <table style="width:100%;border-collapse:collapse;table-layout:fixed;">${chipRows.join('')}</table>
-        </div>`;
-    }).join('');
+const drawCard = (doc, u, y) => {
+  const h = cardHeight(u);
+  const x = PAGE.mL;
 
-    return `
-      <div style="page-break-inside:auto;margin-bottom:14px;">
-        <table style="width:100%;border-collapse:collapse;margin-bottom:8px;page-break-after:avoid;">
-          <tr>
-            <td style="font-size:15px;font-weight:800;color:#0f172a;letter-spacing:.04em;border-bottom:2px solid #dc2626;padding-bottom:4px;">
-              ${esc(brand)}
-            </td>
-            <td style="text-align:right;font-size:9px;font-weight:700;color:#94a3b8;border-bottom:2px solid #dc2626;padding-bottom:4px;">
-              ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'}
-            </td>
-          </tr>
-        </table>
-        ${cards}
-      </div>`;
-  }).join('');
+  doc.setDrawColor(...COLOR.border);
+  doc.setLineWidth(0.7);
+  doc.roundedRect(x, y, CONTENT_W, h, 7, 7, 'S');
 
-  return `
-    <div style="font-family:Helvetica,Arial,sans-serif;color:#0f172a;padding:4px;">
-      <table style="width:100%;border-collapse:collapse;margin-bottom:6px;">
-        <tr>
-          ${dealer.logo ? `<td style="width:70px;vertical-align:middle;"><img src="${esc(dealer.logo)}" style="width:60px;height:60px;object-fit:contain;" /></td>` : ''}
-          <td style="vertical-align:middle;">
-            <div style="font-size:26px;font-weight:900;letter-spacing:-.02em;line-height:1.1;">${esc(dealer.name || 'Inventario')}</div>
-            <div style="font-size:10px;font-weight:700;color:#dc2626;text-transform:uppercase;letter-spacing:.18em;margin-top:2px;">Inventario disponible</div>
-          </td>
-          <td style="text-align:right;vertical-align:middle;font-size:8.5px;color:#64748b;line-height:1.6;">
-            ${dealerLines.map(l => `<div>${esc(l)}</div>`).join('')}
-            <div style="margin-top:3px;font-weight:700;color:#94a3b8;">Descargado: ${esc(today())}</div>
-          </td>
-        </tr>
-      </table>
-      <div style="height:3px;background:#dc2626;border-radius:2px;margin-bottom:14px;"></div>
-      <div style="font-size:9px;font-weight:700;color:#64748b;margin-bottom:12px;">
-        ${rows.length} ${rows.length === 1 ? 'vehículo' : 'vehículos'} · ${brands.length} ${brands.length === 1 ? 'marca' : 'marcas'}
-      </div>
-      ${brandSections}
-    </div>`;
+  const innerX = x + CARD.padX;
+  const innerW = CONTENT_W - CARD.padX * 2;
+
+  // Precio a la derecha; se reserva su ancho para que el título no lo pise.
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(12);
+  const priceStr = u.precio || '—';
+  const priceW = doc.getTextWidth(priceStr);
+  const initialStr = u.inicial ? `Inicial: ${u.inicial}` : '';
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7.5);
+  const initialW = initialStr ? doc.getTextWidth(initialStr) : 0;
+  const rightW = Math.max(priceW, initialW);
+
+  const titleBaseline = y + CARD.padY + 10;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(12);
+  setColor(doc, COLOR.red);
+  doc.text(priceStr, x + CONTENT_W - CARD.padX, titleBaseline, { align: 'right' });
+  if (initialStr) {
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    setColor(doc, COLOR.muted);
+    doc.text(initialStr, x + CONTENT_W - CARD.padX, titleBaseline + 9.5, { align: 'right' });
+  }
+
+  // Modelo + edición
+  const titleMaxW = innerW - rightW - 14;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11.5);
+  setColor(doc, COLOR.dark);
+  const model = fit(doc, u.modelo, titleMaxW);
+  doc.text(model, innerX, titleBaseline);
+  if (u.edicion) {
+    const used = doc.getTextWidth(model);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9.5);
+    setColor(doc, COLOR.muted);
+    doc.text(fit(doc, u.edicion, titleMaxW - used - 5), innerX + used + 5, titleBaseline);
+  }
+
+  // Detalles en 4 columnas
+  const chips = cardChips(u);
+  const colW = (innerW - CARD.colGap * (CARD.cols - 1)) / CARD.cols;
+  chips.forEach((chip, i) => {
+    const [key, label] = chip;
+    const col = i % CARD.cols;
+    const row = Math.floor(i / CARD.cols);
+    const cx = innerX + col * (colW + CARD.colGap);
+    const cy = y + CARD.padY + CARD.titleH + row * CARD.rowH;
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(6.2);
+    setColor(doc, COLOR.label);
+    doc.text(fit(doc, label.toUpperCase(), colW), cx, cy + 6);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.6);
+    setColor(doc, COLOR.value);
+    doc.text(fit(doc, u[key], colW), cx, cy + 16);
+  });
+
+  return h;
+};
+
+// Encabezado grande, solo en la primera página. Sin logo: se pidió quitarlo.
+const drawMainHeader = (doc, dealer, totalRows, totalBrands) => {
+  let y = PAGE.mT;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(21);
+  setColor(doc, COLOR.dark);
+  doc.text(fit(doc, dealer.name || 'Inventario', CONTENT_W * 0.62), PAGE.mL, y + 14);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  setColor(doc, COLOR.red);
+  doc.text('INVENTARIO DISPONIBLE', PAGE.mL, y + 26);
+
+  // Datos del dealer, alineados a la derecha
+  const lines = [dealer.address, dealer.phone, dealer.website].map(text).filter(Boolean);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7.5);
+  setColor(doc, COLOR.muted);
+  const rightX = PAGE.w - PAGE.mR;
+  lines.forEach((l, i) => doc.text(fit(doc, l, CONTENT_W * 0.36), rightX, y + 6 + i * 10, { align: 'right' }));
+  doc.setFont('helvetica', 'bold');
+  setColor(doc, COLOR.label);
+  const dateBaseline = y + 6 + lines.length * 10 + 2;
+  doc.text(`Descargado: ${today()}`, rightX, dateBaseline, { align: 'right' });
+
+  // La regla roja va debajo de TODO el encabezado: el bloque de contacto crece
+  // con la cantidad de datos que tenga el dealer, y con un tope fijo la fecha
+  // quedaba tachada por la línea.
+  y = Math.max(y + 34, dateBaseline + 7);
+  doc.setFillColor(...COLOR.red);
+  doc.rect(PAGE.mL, y, CONTENT_W, 2.4, 'F');
+  y += 14;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8);
+  setColor(doc, COLOR.muted);
+  doc.text(
+    `${totalRows} ${totalRows === 1 ? 'vehículo' : 'vehículos'}  ·  ${totalBrands} ${totalBrands === 1 ? 'marca' : 'marcas'}`,
+    PAGE.mL, y
+  );
+
+  return y + 12;
+};
+
+// Encabezado delgado para las páginas siguientes.
+const drawRunningHeader = (doc, dealer) => {
+  const y = PAGE.mT;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9);
+  setColor(doc, COLOR.dark);
+  doc.text(fit(doc, dealer.name || 'Inventario', CONTENT_W * 0.7), PAGE.mL, y);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7);
+  setColor(doc, COLOR.label);
+  doc.text('INVENTARIO DISPONIBLE', PAGE.w - PAGE.mR, y, { align: 'right' });
+
+  doc.setFillColor(...COLOR.red);
+  doc.rect(PAGE.mL, y + 5, CONTENT_W, 1.6, 'F');
+  return y + 20;
+};
+
+const drawBrandHeader = (doc, brand, count, y) => {
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  setColor(doc, COLOR.dark);
+  doc.text(fit(doc, brand, CONTENT_W * 0.7), PAGE.mL, y + 11);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  setColor(doc, COLOR.label);
+  doc.text(`${count} ${count === 1 ? 'unidad' : 'unidades'}`, PAGE.w - PAGE.mR, y + 11, { align: 'right' });
+
+  doc.setFillColor(...COLOR.red);
+  doc.rect(PAGE.mL, y + 16, CONTENT_W, 1.6, 'F');
+
+  return y + BRAND.headerH;
+};
+
+const drawFooters = (doc) => {
+  const total = doc.getNumberOfPages();
+  for (let p = 1; p <= total; p++) {
+    doc.setPage(p);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7);
+    setColor(doc, COLOR.label);
+    doc.text(`Página ${p} de ${total}`, PAGE.w / 2, PAGE.h - 26, { align: 'center' });
+  }
 };
 
 export const exportInventoryPDF = async (inventory, dealer = {}) => {
   const rows = getExportableVehicles(inventory);
   if (rows.length === 0) return 0;
 
-  const element = document.createElement('div');
-  element.innerHTML = buildInventoryPdfHtml(rows, dealer);
-  element.style.width = '7.5in';
-  document.body.appendChild(element);
+  const { jsPDF } = await import('jspdf');
+  const doc = new jsPDF({ unit: 'pt', format: 'letter', orientation: 'portrait' });
 
-  try {
-    const html2pdf = (await import('html2pdf.js')).default;
-    await html2pdf().set({
-      margin: [0.4, 0.4, 0.5, 0.4],
-      filename: `Inventario_${slug(dealer.name)}_${todayStamp()}.pdf`,
-      image: { type: 'jpeg', quality: 0.98 },
-      html2canvas: { scale: 2, useCORS: true, letterRendering: true },
-      jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' },
-      pagebreak: { mode: ['css', 'legacy'] },
-    }).from(element).save();
-  } finally {
-    document.body.removeChild(element);
-  }
+  const byBrand = rows.reduce((acc, r) => { (acc[r.marca] ||= []).push(r); return acc; }, {});
+  const brands = Object.keys(byBrand).sort((a, b) => a.localeCompare(b, 'es'));
+
+  const limitY = PAGE.h - PAGE.mB;
+  let y = drawMainHeader(doc, dealer, rows.length, brands.length);
+
+  const newPage = () => {
+    doc.addPage();
+    return drawRunningHeader(doc, dealer);
+  };
+
+  brands.forEach((brand, brandIdx) => {
+    const units = byBrand[brand];
+    if (brandIdx > 0) y += BRAND.gapAbove;
+
+    // El título de marca nunca se queda solo al final de una página: si no
+    // cabe junto a su primera unidad, se pasa completo a la siguiente. Es
+    // preferible dejar el espacio en blanco al final.
+    const firstBlock = BRAND.headerH + BRAND.gapBelow + cardHeight(units[0]);
+    if (y + firstBlock > limitY) y = newPage();
+
+    y = drawBrandHeader(doc, brand, units.length, y) + BRAND.gapBelow;
+
+    units.forEach((u) => {
+      const h = cardHeight(u);
+      // Una unidad nunca se parte entre dos páginas.
+      if (y + h > limitY) y = newPage();
+      drawCard(doc, u, y);
+      y += h + CARD.gapBelow;
+    });
+  });
+
+  drawFooters(doc);
+  doc.save(`Inventario_${slug(dealer.name)}_${todayStamp()}.pdf`);
   return rows.length;
 };
