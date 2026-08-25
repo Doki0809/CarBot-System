@@ -40,6 +40,7 @@ import { fetchDealerRateConfig, resolveExchangeRate, convertAmount, getLastRateM
 import { formatWithCommas, parseCommaNumber, cursorPosAfterFormat } from './utils/formatInput.js';
 import { loadGoogleMaps, parseGooglePlace } from './utils/googleMaps.js';
 import { getExportableVehicles, exportInventoryCSV, exportInventoryPDF } from './utils/inventoryExport.js';
+import { startVersionWatcher } from './utils/appVersion.js';
 // Heavy views loaded on demand (only when their tab/route is active) to shrink the initial bundle.
 const VehicleEditView = lazy(() => import('./VehicleEditView'));
 const ContactsView = lazy(() => import('./ContactsView'));
@@ -6318,6 +6319,33 @@ const ImportInventoryModal = ({ isOpen, onClose, onSave, userProfile, resolvedDe
   );
 };
 
+// Aviso de versión nueva. No recarga solo: si el dealer está a medio llenar un
+// vehículo, recargarle la página le borraría lo escrito.
+const NewVersionBanner = ({ onReload }) => (
+  <div
+    className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[10000] flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl animate-in slide-in-from-bottom-4 duration-500 max-w-[calc(100vw-2rem)]"
+    style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-glass)' }}
+  >
+    <div className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0 bg-red-600">
+      <RefreshCw size={17} className="text-white" />
+    </div>
+    <div className="min-w-0">
+      <p className="text-xs font-black leading-tight" style={{ color: 'var(--text-primary)' }}>
+        Hay una versión nueva
+      </p>
+      <p className="text-[11px] font-semibold leading-tight" style={{ color: 'var(--text-secondary)' }}>
+        Actualiza para ver los últimos cambios.
+      </p>
+    </div>
+    <button
+      onClick={onReload}
+      className="px-4 py-2 rounded-xl text-[11px] font-black uppercase tracking-wide text-white bg-red-600 hover:bg-red-700 transition-all active:scale-95 shrink-0"
+    >
+      Actualizar
+    </button>
+  </div>
+);
+
 const ExportInventoryModal = ({ isOpen, onClose, inventory, userProfile, showToast }) => {
   const [busy, setBusy] = useState(null); // 'csv' | 'pdf'
 
@@ -8424,6 +8452,12 @@ export default function CarbotApp() {
   const [ghlConversations, setGhlConversations] = useState([]);
   const [conversationsLoading, setConversationsLoading] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false); // mobile: chat panel open
+
+  // Aviso de deploy nuevo: los dealers dejan la pestaña abierta días (y dentro
+  // del iframe de GHL casi nunca se recarga), así que un cambio podía tardar
+  // muchísimo en llegarles.
+  const [hasNewVersion, setHasNewVersion] = useState(false);
+  useEffect(() => startVersionWatcher(() => setHasNewVersion(true)), []);
   const [conversationsLastFetched, setConversationsLastFetched] = useState(null);
 
   const [userProfile, setUserProfile] = useState(null);
@@ -11061,6 +11095,11 @@ export default function CarbotApp() {
         </AnimatePresence>
       </AppLayout>
       <Toaster position="top-right" theme={isDark ? 'dark' : 'light'} offset={{ top: 20, right: 20 }} options={{ roundness: 16, duration: 3500 }} />
+
+      {hasNewVersion && createPortal(
+        <NewVersionBanner onReload={() => window.location.reload()} />,
+        document.body
+      )}
 
       {isContractModalOpen && createPortal(
         <GenerateContractModal
