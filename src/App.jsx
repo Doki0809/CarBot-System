@@ -9154,7 +9154,10 @@ export default function CarbotApp() {
 
             // If superadmin has NO profile yet (not even in local storage selection), show dealer picker
             if (!profileData && !isAutoLogin) {
-              const { data: dealers } = await supabase.from('dealers').select('*').order('nombre', { ascending: true });
+              const { data: dealers, error: dealersErr } = await supabase.from('dealers').select('*').order('nombre', { ascending: true });
+              // Antes el error se descartaba y el selector abría vacío, que se
+              // veía igual que "no hay cuentas".
+              if (dealersErr) console.error('❌ No se pudo cargar la lista de cuentas:', dealersErr);
               setAllDealers(dealers || []);
               setShowDealerSwitcher(true);
               setInitializing(false);
@@ -9518,6 +9521,21 @@ export default function CarbotApp() {
         }
       }
     });
+  };
+
+  // Cierre de sesión duro: no pasa por el modal de confirmación ni depende de
+  // que Supabase responda. Es la salida cuando la sesión quedó a medias y la
+  // app no logra resolver un dealer (antes no había forma de salir).
+  const forceSignOut = async () => {
+    try { await supabase.auth.signOut({ scope: 'local' }); } catch { /* la sesión local se limpia igual abajo */ }
+    try {
+      localStorage.removeItem('lastUserEmail');
+      Object.keys(localStorage)
+        .filter(k => k.startsWith('selected_dealer_'))
+        .forEach(k => localStorage.removeItem(k));
+      sessionStorage.setItem('manualLogout', 'true');
+    } catch { /* modo privado: no se puede tocar el storage */ }
+    window.location.href = window.location.origin + window.location.pathname;
   };
 
   const handleLogout = () => {
@@ -11064,6 +11082,66 @@ export default function CarbotApp() {
           }} />
         </div>
       </div>
+    );
+  }
+
+  // Sesión iniciada pero sin dealer resuelto: la app no tiene contexto con el
+  // que trabajar y antes renderizaba una cáscara con datos de relleno ("Admin",
+  // "Dealer", "usuario@dealer.com"), sin inventario y sin forma de salir.
+  // Ahora se ofrece elegir cuenta o cerrar sesión.
+  if (isLoggedIn && !shadowProfile && !isStoreRoute) {
+    return (
+      <>
+        <div className="min-h-screen flex items-center justify-center p-6" style={{ background: 'var(--bg-primary)' }}>
+          <div className="w-full max-w-md rounded-3xl p-8 text-center" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-glass)', boxShadow: 'var(--shadow-modal)' }}>
+            <div className="w-14 h-14 rounded-2xl mx-auto mb-5 flex items-center justify-center bg-red-600">
+              <Building2 size={26} className="text-white" />
+            </div>
+            <h1 className="text-xl font-black mb-2" style={{ color: 'var(--text-primary)' }}>
+              No hay una cuenta seleccionada
+            </h1>
+            <p className="text-sm font-semibold mb-7 leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+              Tu sesión está activa pero no se pudo cargar el concesionario. Elige una cuenta para continuar o cierra sesión y vuelve a entrar.
+            </p>
+            <div className="flex flex-col gap-3">
+              {(isSuperAdmin || allDealers.length > 0) && (
+                <button
+                  onClick={() => { refreshAllDealers(); setShowDealerSwitcher(true); }}
+                  className="w-full py-3.5 rounded-2xl text-xs font-black uppercase tracking-widest text-white bg-red-600 hover:bg-red-700 transition-all active:scale-[0.98]"
+                >
+                  Elegir cuenta
+                </button>
+              )}
+              <button
+                onClick={() => window.location.reload()}
+                className="w-full py-3.5 rounded-2xl text-xs font-black uppercase tracking-widest transition-all active:scale-[0.98]"
+                style={{ background: 'var(--input-bg)', color: 'var(--text-primary)', border: '1px solid var(--border-glass)' }}
+              >
+                Reintentar
+              </button>
+              <button
+                onClick={forceSignOut}
+                className="w-full py-3 text-xs font-black uppercase tracking-widest transition-colors"
+                style={{ color: 'var(--text-tertiary)' }}
+              >
+                Cerrar sesión
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <DealerSwitcherModal
+          isOpen={showDealerSwitcher}
+          onClose={() => setShowDealerSwitcher(false)}
+          dealers={allDealers}
+          onSelect={handleDealerSelect}
+          isSuperAdmin={isSuperAdmin}
+          canEnterAnyAccount={isSuperAdmin}
+          platformAdmins={[]}
+          showToast={showToast}
+        />
+        <Toaster position="top-right" theme={isDark ? 'dark' : 'light'} offset={{ top: 20, right: 20 }} options={{ roundness: 16, duration: 3500 }} />
+      </>
     );
   }
 
