@@ -396,7 +396,7 @@ const PHOTO_HARD_LIMIT_MB = 8;
 // Arranca automático con el primer banco configurado en Ajustes y el plazo por
 // defecto, pero la tasa y el plazo se pueden escribir a mano sin tocar la
 // configuración del dealer.
-const FinancingSimulator = ({ price, priceCurrency, initial, initialCurrency, rateConfig, userProfile, getSymbol }) => {
+const FinancingSimulator = ({ price, priceCurrency, initial, initialCurrency, rateConfig, userProfile, getSymbol, saved, onChange }) => {
   const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
   const [banks, setBanks] = useState([]);
   const [loadingBanks, setLoadingBanks] = useState(true);
@@ -419,8 +419,11 @@ const FinancingSimulator = ({ price, priceCurrency, initial, initialCurrency, ra
       const list = data || [];
       setBanks(list);
       if (list.length > 0) {
-        setBankId(prev => prev ?? list[0].id);
-        setTerm(prev => prev || list[0].plazo_maximo_meses || 48);
+        // Lo guardado en el vehículo manda; si no hay nada, el primer banco.
+        const savedBankExists = saved?.bankId && list.some(b => b.id === saved.bankId);
+        setBankId(savedBankExists ? saved.bankId : list[0].id);
+        setTerm(saved?.term || list[0].plazo_maximo_meses || 48);
+        if (saved?.manualRate !== null && saved?.manualRate !== undefined) setManualRate(String(saved.manualRate));
       }
       setLoadingBanks(false);
     })();
@@ -428,6 +431,17 @@ const FinancingSimulator = ({ price, priceCurrency, initial, initialCurrency, ra
   }, [dealerId]);
 
   const selectedBank = banks.find(b => b.id === bankId) || null;
+
+  // El formulario guarda esta elección con el vehículo: es la que la API expone
+  // como "opción recomendada" para los bots.
+  useEffect(() => {
+    if (loadingBanks || !onChange) return;
+    onChange({
+      bankId: manualRate !== '' ? bankId : (bankId ?? null),
+      term: parseInt(term, 10) || null,
+      manualRate: manualRate === '' ? null : Number(manualRate),
+    });
+  }, [bankId, term, manualRate, loadingBanks, onChange]);
 
   // La tasa manual gana sobre la del banco; si no hay ninguna, no hay cálculo.
   const effectiveRate = manualRate !== '' ? Number(manualRate) : (selectedBank ? Number(selectedBank.tasa_anual) : NaN);
@@ -633,6 +647,17 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
   // sin ese estado, borrar la casilla escribía un 0 al instante y el siguiente
   // dígito quedaba pegado detrás ("0100").
   const [customInitialPct, setCustomInitialPct] = useState(null);
+  // Elección de financiamiento de esta unidad (banco/plazo/tasa manual). Se
+  // guarda con el vehículo para que la API la publique como opción principal.
+  const [financing, setFinancing] = useState({ bankId: null, term: null, manualRate: null });
+  const handleFinancingChange = useCallback((next) => {
+    setFinancing(prev => (
+      prev.bankId === next.bankId && prev.term === next.term && prev.manualRate === next.manualRate
+        ? prev
+        : next
+    ));
+  }, []);
+  const [savedFinancing, setSavedFinancing] = useState(null);
   const globalInitialPct = rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT;
   const hasCustomInitialPct = customInitialPct !== null && customInitialPct !== '';
   const effectiveInitialPct = hasCustomInitialPct ? Number(customInitialPct) : globalInitialPct;
@@ -744,6 +769,11 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       // Si ya tiene precio guardado pero nunca se le puso inicial, asumimos que se
       // dejó vacío a propósito la vez anterior — mostrar el checkbox ya marcado.
       setLeaveInitialEmpty(!hasRealInitial && hasRealPrice);
+      setSavedFinancing({
+        bankId: initialData.financiamiento_banco_id || null,
+        term: initialData.financiamiento_plazo_meses || null,
+        manualRate: initialData.financiamiento_tasa_manual ?? null,
+      });
       setCustomInitialPct(
         initialData.porcentaje_inicial === null || initialData.porcentaje_inicial === undefined
           ? null
@@ -768,6 +798,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       initialManuallyEditedRef.current = false;
       setLeaveInitialEmpty(false);
       setCustomInitialPct(null);
+      setSavedFinancing(null);
     }
   }, [initialData, isOpen]);
 
@@ -948,6 +979,12 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     // del recálculo masivo cuando se cambia el % general en Ajustes.
     // '' (casilla vacía al guardar sin salir del campo) cuenta como "sin % propio".
     data.porcentaje_inicial = hasCustomInitialPct ? Number(customInitialPct) : null;
+    // Opción de financiamiento que la API expone como principal para los bots.
+    data.financiamiento_banco_id = financing.bankId || null;
+    data.financiamiento_plazo_meses = financing.term || null;
+    data.financiamiento_tasa_manual = (financing.manualRate === null || financing.manualRate === undefined || Number.isNaN(financing.manualRate))
+      ? null
+      : Number(financing.manualRate);
     delete data.initial_unified;
 
     // --- MILLAJE ---
@@ -1491,6 +1528,8 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                 rateConfig={rateConfig}
                 userProfile={userProfile}
                 getSymbol={getSymbol}
+                saved={savedFinancing}
+                onChange={handleFinancingChange}
               />
             </div>
 
@@ -10264,6 +10303,16 @@ export default function CarbotApp() {
         // dealer (y el recálculo masivo de Ajustes puede tocarlo); un número lo
         // deja fuera de ese recálculo. Se respeta null explícito para poder
         // volver a atarlo al global.
+        // Financiamiento preferido de la unidad; null explícito lo desvincula.
+        financiamiento_banco_id: Object.prototype.hasOwnProperty.call(vehicleData, 'financiamiento_banco_id')
+          ? (vehicleData.financiamiento_banco_id || null)
+          : (existingRecord?.financiamiento_banco_id ?? null),
+        financiamiento_plazo_meses: Object.prototype.hasOwnProperty.call(vehicleData, 'financiamiento_plazo_meses')
+          ? (vehicleData.financiamiento_plazo_meses ? Number(vehicleData.financiamiento_plazo_meses) : null)
+          : (existingRecord?.financiamiento_plazo_meses ?? null),
+        financiamiento_tasa_manual: Object.prototype.hasOwnProperty.call(vehicleData, 'financiamiento_tasa_manual')
+          ? (vehicleData.financiamiento_tasa_manual === null || vehicleData.financiamiento_tasa_manual === '' ? null : Number(vehicleData.financiamiento_tasa_manual))
+          : (existingRecord?.financiamiento_tasa_manual ?? null),
         porcentaje_inicial: Object.prototype.hasOwnProperty.call(vehicleData, 'porcentaje_inicial')
           ? (vehicleData.porcentaje_inicial === null || vehicleData.porcentaje_inicial === '' ? null : Number(vehicleData.porcentaje_inicial))
           : (existingRecord?.porcentaje_inicial ?? null),
