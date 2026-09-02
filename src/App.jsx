@@ -386,6 +386,206 @@ const COMPRESSION_STEPS = [
 // archivo así tarda muchísimo y probablemente falle a mitad de camino.
 const PHOTO_HARD_LIMIT_MB = 8;
 
+// Simulador de cuotas dentro de la ficha del vehículo.
+//
+// Usa la MISMA fórmula de amortización que la calculadora pública del detalle
+// del vehículo (functions/index.js), para que lo que ve el dealer aquí sea
+// exactamente lo que verá su cliente:
+//   cuota = monto * r * (1+r)^n / ((1+r)^n - 1),  r = tasa_anual/100/12
+//
+// Arranca automático con el primer banco configurado en Ajustes y el plazo por
+// defecto, pero la tasa y el plazo se pueden escribir a mano sin tocar la
+// configuración del dealer.
+const FinancingSimulator = ({ price, priceCurrency, initial, initialCurrency, rateConfig, userProfile, getSymbol }) => {
+  const dealerId = userProfile?.supabaseDealerId || userProfile?.dealerId || '';
+  const [banks, setBanks] = useState([]);
+  const [loadingBanks, setLoadingBanks] = useState(true);
+  const [bankId, setBankId] = useState(null);      // null = tasa manual
+  const [term, setTerm] = useState(48);
+  const [manualRate, setManualRate] = useState(''); // '' = usa la del banco
+
+  useEffect(() => {
+    if (!dealerId) { setLoadingBanks(false); return; }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('dealer_financing_banks')
+        .select('id, banco, tasa_anual, max_financiamiento_pct, plazo_maximo_meses, activo')
+        .eq('dealer_id', dealerId)
+        .eq('activo', true)
+        .order('orden', { ascending: true });
+      if (cancelled) return;
+      if (error) console.error('Error cargando bancos para el simulador:', error);
+      const list = data || [];
+      setBanks(list);
+      if (list.length > 0) {
+        setBankId(prev => prev ?? list[0].id);
+        setTerm(prev => prev || list[0].plazo_maximo_meses || 48);
+      }
+      setLoadingBanks(false);
+    })();
+    return () => { cancelled = true; };
+  }, [dealerId]);
+
+  const selectedBank = banks.find(b => b.id === bankId) || null;
+
+  // La tasa manual gana sobre la del banco; si no hay ninguna, no hay cálculo.
+  const effectiveRate = manualRate !== '' ? Number(manualRate) : (selectedBank ? Number(selectedBank.tasa_anual) : NaN);
+
+  // El precio y el inicial pueden estar en monedas distintas: todo se lleva a
+  // la moneda del precio antes de restar.
+  const priceNum = Number(price) || 0;
+  const initialRaw = Number(initial) || 0;
+  const initialInPriceCurrency = (initialCurrency && priceCurrency && initialCurrency !== priceCurrency && rateConfig?.ratesToPrimary)
+    ? convertAmount(initialRaw, initialCurrency, priceCurrency, rateConfig.ratesToPrimary)
+    : initialRaw;
+
+  const financed = Math.max(priceNum - initialInPriceCurrency, 0);
+  const months = Math.max(parseInt(term, 10) || 0, 0);
+
+  const hasInputs = priceNum > 0 && months > 0 && Number.isFinite(effectiveRate) && effectiveRate >= 0;
+  let monthly = 0, totalPaid = 0, totalInterest = 0;
+  if (hasInputs && financed > 0) {
+    const r = (effectiveRate / 100) / 12;
+    monthly = r > 0
+      ? (financed * r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1)
+      : financed / months;
+    totalPaid = monthly * months;
+    totalInterest = totalPaid - financed;
+  }
+
+  const sym = getSymbol ? getSymbol(priceCurrency) : '';
+  const fmt = (n) => `${sym} ${Math.round(n).toLocaleString('en-US')}`;
+
+  // Aviso: el banco no financia por encima de su tope.
+  const financedPct = priceNum > 0 ? (financed / priceNum) * 100 : 0;
+  const overLimit = selectedBank && manualRate === '' && financedPct > Number(selectedBank.max_financiamiento_pct) + 0.01;
+
+  const chip = (active) => `px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wide transition-all ${active ? 'bg-red-600 text-white shadow-sm' : 'text-slate-500 hover:text-slate-800 bg-white border border-slate-200'}`;
+
+  return (
+    <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-5">
+      <div className="flex items-center gap-2 mb-4">
+        <CreditCard size={15} className="text-red-500" />
+        <h3 className="text-[11px] font-black text-slate-500 uppercase tracking-[0.2em]">Simulador de cuotas</h3>
+      </div>
+
+      {loadingBanks ? (
+        <p className="text-[11px] font-bold text-slate-400">Cargando bancos...</p>
+      ) : (
+        <>
+          {banks.length > 0 && (
+            <div className="mb-4">
+              <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1.5">Banco</p>
+              <div className="flex flex-wrap gap-1.5">
+                {banks.map(b => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    onClick={() => { setBankId(b.id); setManualRate(''); }}
+                    className={chip(bankId === b.id && manualRate === '')}
+                  >
+                    {b.banco} · {Number(b.tasa_anual)}%
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+            <div>
+              <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1.5">
+                Tasa anual {manualRate === '' && selectedBank ? '(del banco)' : '(manual)'}
+              </p>
+              <div className="flex items-center gap-1 px-3 h-10 rounded-xl bg-white border border-slate-200">
+                <input
+                  type="number" min="0" max="100" step="0.01"
+                  value={manualRate !== '' ? manualRate : (selectedBank ? Number(selectedBank.tasa_anual) : '')}
+                  placeholder="Ej. 16.50"
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setManualRate(raw === '' ? '' : raw);
+                  }}
+                  className="flex-1 min-w-0 bg-transparent text-sm font-black text-slate-800 outline-none"
+                />
+                <span className="text-sm font-black text-slate-400">%</span>
+              </div>
+              {manualRate !== '' && (
+                <button
+                  type="button"
+                  onClick={() => setManualRate('')}
+                  className="mt-1 text-[9px] font-black uppercase tracking-wide text-slate-400 hover:text-red-600"
+                >
+                  Volver a la del banco
+                </button>
+              )}
+            </div>
+
+            <div>
+              <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1.5">Plazo (meses)</p>
+              <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap gap-1.5">
+                  {FINANCING_TERM_OPTIONS.map(t => (
+                    <button key={t} type="button" onClick={() => setTerm(t)} className={chip(Number(term) === t)}>{t}</button>
+                  ))}
+                </div>
+                <input
+                  type="number" min="1" max="120" step="1"
+                  value={term}
+                  onChange={(e) => setTerm(e.target.value)}
+                  className="w-14 h-10 px-2 rounded-xl bg-white border border-slate-200 text-sm font-black text-slate-800 text-center outline-none"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Resultado */}
+          {hasInputs && financed > 0 ? (
+            <div className="rounded-xl bg-white border border-slate-200 p-4">
+              <p className="text-[10px] font-black text-slate-400 uppercase tracking-wider">
+                {months} cuotas mensuales de
+              </p>
+              <p className="text-3xl font-black text-red-600 leading-tight mt-0.5">{fmt(monthly)}</p>
+              <p className="text-[11px] font-bold text-slate-500 mt-1">
+                al {effectiveRate}% anual{selectedBank && manualRate === '' ? ` · ${selectedBank.banco}` : ''}
+              </p>
+
+              <div className="grid grid-cols-3 gap-3 mt-4 pt-3 border-t border-slate-100">
+                {[
+                  ['A financiar', fmt(financed)],
+                  ['Total a pagar', fmt(totalPaid)],
+                  ['Intereses', fmt(totalInterest)],
+                ].map(([label, val]) => (
+                  <div key={label}>
+                    <p className="text-[8px] font-black text-slate-400 uppercase tracking-wider">{label}</p>
+                    <p className="text-xs font-black text-slate-800 mt-0.5">{val}</p>
+                  </div>
+                ))}
+              </div>
+
+              {overLimit && (
+                <p className="mt-3 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  {selectedBank.banco} financia hasta {Number(selectedBank.max_financiamiento_pct)}% del precio y aquí estás financiando {financedPct.toFixed(1)}%. Sube el inicial o usa otro banco.
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="text-[11px] font-bold text-slate-400">
+              {priceNum <= 0
+                ? 'Escribe el precio de venta para ver las cuotas.'
+                : financed <= 0
+                  ? 'El inicial cubre el precio completo: no hay monto a financiar.'
+                  : banks.length === 0
+                    ? 'Agrega un banco en Ajustes → Financiamiento, o escribe una tasa manual.'
+                    : 'Escribe una tasa y un plazo para ver las cuotas.'}
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
 const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile }) => {
   const { t } = useI18n();
   const { selected: selectedCurrencies, getSymbol } = useCurrency();
@@ -1282,6 +1482,16 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                   <input type="hidden" name="status" value={status} />
                 </div>
               </div>
+
+              <FinancingSimulator
+                price={prices.price}
+                priceCurrency={currency}
+                initial={prices.initial}
+                initialCurrency={downPaymentCurrency}
+                rateConfig={rateConfig}
+                userProfile={userProfile}
+                getSymbol={getSymbol}
+              />
             </div>
 
             {/* IMÁGENES */}
