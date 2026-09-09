@@ -1,5 +1,12 @@
 import urllib.request, json, ssl
 
+import os
+
+# La credencial se lee del entorno: este script vivía con un token de
+# Supabase en texto plano dentro de un repo publico.
+ADMIN_TOKEN = os.environ['SUPABASE_ACCESS_TOKEN']
+
+
 ctx = ssl.create_default_context()
 
 sql = """
@@ -17,7 +24,7 @@ req = urllib.request.Request(
     data=payload,
     method='POST'
 )
-req.add_header('Authorization', 'Bearer sbp_1c9d61d15925cf3579e6294023069d120525ff60')
+req.add_header('Authorization', f'Bearer {ADMIN_TOKEN}')
 req.add_header('Content-Type', 'application/json')
 req.add_header('Accept', 'application/json')
 

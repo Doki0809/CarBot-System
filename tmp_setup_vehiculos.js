@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || 'https://eoxngsmdwzomofaqamog.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_ACCESS_TOKEN || 'sbp_1c9d61d15925cf3579e6294023069d120525ff60'; // The personal access token isn't the service_role key.
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_ACCESS_TOKEN || process.env.SUPABASE_ACCESS_TOKEN; // The personal access token isn't the service_role key.
 
 console.log("Using URL:", SUPABASE_URL);
 

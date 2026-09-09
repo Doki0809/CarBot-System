@@ -1,4 +1,4 @@
-const adminKey = "sbp_1c9d61d15925cf3579e6294023069d120525ff60";
+const adminKey = process.env.SUPABASE_ACCESS_TOKEN;
 const projectRef = "lpiwkennlavpzisdvnnh";
 const queryUrl = `https://api.supabase.com/v1/projects/${projectRef}/database/query`;
 
