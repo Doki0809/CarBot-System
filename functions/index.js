@@ -121,6 +121,22 @@ const capitalize = (val) => {
 
 const CURRENCY_SYMBOLS = { DOP: 'RD$', USD: 'US$', EUR: '€', COP: 'COP$' };
 
+// Cuota mensual con amortización francesa. Es la MISMA fórmula que usan el
+// simulador del panel, la calculadora pública del vehículo y la API de
+// inventario: si alguna se desvía, el cliente ve una cifra en el catálogo y
+// otra por WhatsApp.
+const calcMonthlyPayment = (principal, annualRatePct, months) => {
+  if (!(principal > 0) || !(months > 0)) return 0;
+  const r = (Number(annualRatePct) / 100) / 12;
+  return r > 0
+    ? (principal * r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1)
+    : principal / months;
+};
+
+// Plazos que se cotizan cuando el cliente pregunta por otro tiempo. Se filtran
+// por el máximo real de cada banco antes de publicarse.
+const FINANCING_TERMS = [6, 12, 24, 36, 48, 60, 72];
+
 // Construye el link de WhatsApp del dealer. Si el dealer configuró un link
 // completo (wa.me/api.whatsapp.com), se reescribe con el mensaje del vehículo;
 // si es otro tipo de link (ej. invitación de grupo), se usa tal cual.
@@ -1063,10 +1079,6 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
         let cuotaDesdeText = null;
         if (financingBanks.length > 0) {
           const montoBase = Math.max(precioNativeVal - inicialNativeVal, 0);
-          const calcMonthlyPayment = (principal, annualRatePct, months) => {
-            const r = (annualRatePct / 100) / 12;
-            return r > 0 ? (principal * r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1) : (principal / months);
-          };
           const bestCuota = financingBanks.reduce((min, b) => {
             const term = Math.min(48, Number(b.plazo_maximo_meses) || 48);
             const cuota = calcMonthlyPayment(montoBase, Number(b.tasa_anual), term);
@@ -2858,9 +2870,95 @@ exports.inventorySearch = onRequest({ cors: true, secrets: [supabaseServiceKey] 
       });
     }
 
+    // ── FINANCIAMIENTO ──────────────────────────────────────────────
+    // La fila solo guarda el UUID del banco elegido, así que un consumidor
+    // externo (los bots) no tiene forma de traducirlo a "Banco BACC · 16.7%":
+    // no existe endpoint de bancos. Por eso la tasa efectiva, el nombre y la
+    // cuota se resuelven aquí y viajan ya calculadas.
+    const { data: bankRows, error: bankErr } = await supabaseAdmin
+      .from('dealer_financing_banks')
+      .select('id, banco, tasa_anual, max_financiamiento_pct, plazo_maximo_meses')
+      .eq('dealer_id', dealerId)
+      .eq('activo', true)
+      .order('orden', { ascending: true });
+    if (bankErr) throw bankErr;
+    const banks = (bankRows || []).map(b => ({
+      id: b.id,
+      banco: b.banco,
+      tasa_anual: Number(b.tasa_anual),
+      max_financiamiento_pct: Number(b.max_financiamiento_pct),
+      plazo_maximo_meses: Number(b.plazo_maximo_meses),
+    }));
+
+    // Devuelve los campos de financiamiento ya resueltos para un vehículo, o
+    // null cuando no hay con qué cotizar (dealer sin bancos, sin precio, o
+    // inicial que cubre el precio completo). Nunca inventa una tasa.
+    const resolveFinancing = (v) => {
+      if (banks.length === 0) return null;
+      const precio = Number(v.precio) || 0;
+      if (precio <= 0) return null;
+
+      // Precio e inicial pueden estar en monedas distintas y aquí no hay tasa
+      // de cambio: en ese caso no se descuenta el inicial y se avisa, en vez
+      // de restar un número incorrecto.
+      const monedaPrecio = v.moneda_precio || 'USD';
+      const monedaInicial = v.moneda_inicial || monedaPrecio;
+      const mismaMoneda = monedaPrecio === monedaInicial;
+      const inicialAplicado = mismaMoneda ? (Number(v.inicial) || 0) : 0;
+      const financiado = Math.max(precio - inicialAplicado, 0);
+      if (financiado <= 0) return null;
+
+      const manualRate = v.financiamiento_tasa_manual === null || v.financiamiento_tasa_manual === undefined
+        ? null
+        : Number(v.financiamiento_tasa_manual);
+
+      // Opción principal: la que el dealer dejó elegida en la ficha. Sin
+      // elección guardada cae al primer banco activo, que es lo que muestra el
+      // simulador del panel al abrirse.
+      const chosen = banks.find(b => b.id === v.financiamiento_banco_id) || banks[0];
+      const tasaEfectiva = manualRate !== null ? manualRate : chosen.tasa_anual;
+      const plazoEfectivo = Number(v.financiamiento_plazo_meses) || chosen.plazo_maximo_meses;
+
+      const opciones = banks.map(b => {
+        // La tasa manual pertenece al banco que el dealer eligió; los demás
+        // conservan la suya.
+        const rate = (b.id === chosen.id && manualRate !== null) ? manualRate : b.tasa_anual;
+        // Solo los plazos que ese banco realmente ofrece: cotizar 72 meses en
+        // un banco que llega a 48 promete algo que no existe.
+        const terms = FINANCING_TERMS.filter(t => t <= b.plazo_maximo_meses);
+        if (!terms.includes(b.plazo_maximo_meses)) terms.push(b.plazo_maximo_meses);
+        return {
+          banco: b.banco,
+          tasa_anual: rate,
+          max_financiamiento_pct: b.max_financiamiento_pct,
+          plazo_maximo_meses: b.plazo_maximo_meses,
+          cuotas: terms.sort((a, z) => a - z).map(t => ({
+            plazo_meses: t,
+            cuota_mensual: Math.round(calcMonthlyPayment(financiado, rate, t)),
+          })),
+        };
+      });
+
+      return {
+        financiamiento_banco_nombre: chosen.banco,
+        financiamiento_tasa_anual: tasaEfectiva,
+        // Plazo EFECTIVO de la cotización: si el dealer no eligió uno, es el
+        // máximo del banco. Así la cuota siempre corresponde a este plazo.
+        financiamiento_plazo_meses: plazoEfectivo,
+        financiamiento_cuota_mensual: Math.round(calcMonthlyPayment(financiado, tasaEfectiva, plazoEfectivo)),
+        financiamiento_moneda: monedaPrecio,
+        financiamiento_monto_a_financiar: financiado,
+        financiamiento_opciones: opciones,
+        ...(mismaMoneda ? {} : { financiamiento_nota: `El inicial está en ${monedaInicial} y el precio en ${monedaPrecio}; no se descontó. Confirmar con el asesor.` }),
+      };
+    };
+
     const result = vehiculos.map(v => {
       const out = { ...v };
       delete out.deleted_at;
+      // Se aplica DESPUÉS del spread para que el plazo efectivo sustituya al
+      // valor crudo de la fila (null cuando el dealer no eligió plazo).
+      Object.assign(out, resolveFinancing(v) || {});
       if (v.estado === 'Vendido' && buyersByVehicle.has(v.id)) {
         const b = buyersByVehicle.get(v.id);
         out.comprador = {
