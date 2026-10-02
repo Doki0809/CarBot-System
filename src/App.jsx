@@ -600,7 +600,386 @@ const FinancingSimulator = ({ price, priceCurrency, initial, initialCurrency, ra
   );
 };
 
-const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile }) => {
+// ── Garantías ─────────────────────────────────────────────────────────
+// El dealer arma una garantía una vez (título, duración, qué cubre) y la asigna
+// a los vehículos que quiera. Se guardan en `dealer_garantias`; el vehículo solo
+// guarda `garantia_id`, así que editar una garantía actualiza todos sus carros.
+//
+// `cubre` guarda claves estables, no textos: las etiquetas se pueden renombrar
+// aquí sin migrar datos.
+const WARRANTY_COVERAGE_GROUPS = [
+  { title: 'Motor y tren motriz', items: [
+    ['motor', 'Motor'], ['transmision', 'Transmisión'], ['caja_transferencia', 'Caja de transferencia'],
+    ['diferencial', 'Diferencial / tracción'], ['turbo', 'Turbo'], ['enfriamiento', 'Sistema de enfriamiento'],
+    ['combustible', 'Sistema de combustible'], ['escape', 'Escape y catalizador'],
+  ] },
+  { title: 'Chasis', items: [
+    ['suspension', 'Suspensión'], ['direccion', 'Dirección'], ['frenos', 'Frenos'],
+  ] },
+  { title: 'Sistema eléctrico', items: [
+    ['sistema_electrico', 'Sistema eléctrico'], ['bateria', 'Batería'], ['alternador', 'Alternador'],
+    ['arranque', 'Motor de arranque'], ['computadora', 'Computadora (ECU)'], ['sensores', 'Sensores'],
+  ] },
+  { title: 'Confort y tecnología', items: [
+    ['aire_acondicionado', 'Aire acondicionado'], ['vidrios_electricos', 'Vidrios eléctricos'],
+    ['baul_electrico', 'Baúl eléctrico'], ['camara', 'Cámara'], ['pantalla', 'Pantalla / CarPlay'],
+    ['techo', 'Techo / sunroof'], ['llave', 'Llave / push button'],
+  ] },
+];
+
+const WARRANTY_COVERAGE_LABELS = Object.fromEntries(
+  WARRANTY_COVERAGE_GROUPS.flatMap(g => g.items)
+);
+
+const WARRANTY_UNITS = [
+  { value: 'dias', one: 'día', many: 'días' },
+  { value: 'meses', one: 'mes', many: 'meses' },
+  { value: 'anos', one: 'año', many: 'años' },
+];
+
+const formatWarrantyTerm = (valor, unidad) => {
+  const u = WARRANTY_UNITS.find(x => x.value === unidad);
+  if (!u) return '';
+  return `${valor} ${Number(valor) === 1 ? u.one : u.many}`;
+};
+
+// Editor: crear o editar una garantía.
+const WarrantyEditor = ({ initial, dealerId, onClose, onSaved, showToast }) => {
+  const [titulo, setTitulo] = useState(initial?.titulo || '');
+  // El plazo se mantiene como texto mientras se escribe para poder borrar el
+  // campo (Number('') es 0 y pegaría un cero delante).
+  const [valor, setValor] = useState(initial ? String(initial.plazo_valor) : '12');
+  const [unidad, setUnidad] = useState(initial?.plazo_unidad || 'meses');
+  const [cubre, setCubre] = useState(() => new Set(initial?.cubre || []));
+  const [saving, setSaving] = useState(false);
+
+  const toggle = (key) => setCubre(prev => {
+    const next = new Set(prev);
+    next.has(key) ? next.delete(key) : next.add(key);
+    return next;
+  });
+  const toggleGroup = (items) => setCubre(prev => {
+    const next = new Set(prev);
+    const all = items.every(([k]) => next.has(k));
+    items.forEach(([k]) => (all ? next.delete(k) : next.add(k)));
+    return next;
+  });
+
+  const handleSave = async () => {
+    const plazo = parseInt(valor, 10);
+    if (!titulo.trim()) return showToast('Ponle un título a la garantía.', 'warning');
+    if (!(plazo > 0)) return showToast('Indica la duración de la garantía.', 'warning');
+    if (cubre.size === 0) return showToast('Marca al menos una cosa que cubra.', 'warning');
+
+    setSaving(true);
+    const payload = {
+      titulo: titulo.trim(),
+      plazo_valor: plazo,
+      plazo_unidad: unidad,
+      cubre: Array.from(cubre),
+      updated_at: new Date().toISOString(),
+    };
+    const query = initial
+      ? supabase.from('dealer_garantias').update(payload).eq('id', initial.id)
+      : supabase.from('dealer_garantias').insert({ ...payload, dealer_id: dealerId });
+    const { data, error } = await query.select().single();
+    setSaving(false);
+    if (error) {
+      console.error('Error guardando garantía:', error);
+      return showToast(`No se pudo guardar la garantía: ${error.message}`, 'error');
+    }
+    showToast(initial ? 'Garantía actualizada.' : 'Garantía creada.');
+    onSaved(data);
+  };
+
+  const inputStyle = { background: 'var(--input-bg)', border: '1px solid var(--input-border)', color: 'var(--text-primary)' };
+
+  return (
+    <div className="flex flex-col min-h-0">
+      <div className="px-6 pt-5 pb-3 space-y-4 overflow-y-auto">
+        <div>
+          <label className="block text-[10px] font-black uppercase tracking-[0.2em] mb-1.5" style={{ color: 'var(--text-secondary)' }}>Título</label>
+          <input
+            value={titulo}
+            onChange={(e) => setTitulo(e.target.value)}
+            placeholder="Ej. Garantía motor y transmisión"
+            maxLength={80}
+            className="w-full px-4 py-3 rounded-xl text-sm font-bold outline-none"
+            style={inputStyle}
+          />
+        </div>
+
+        <div>
+          <label className="block text-[10px] font-black uppercase tracking-[0.2em] mb-1.5" style={{ color: 'var(--text-secondary)' }}>Tiempo de garantía</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="number" min="1" max="1000" step="1"
+              value={valor}
+              onChange={(e) => setValor(e.target.value)}
+              className="w-20 px-3 py-3 rounded-xl text-sm font-black text-center outline-none"
+              style={inputStyle}
+            />
+            <div className="flex p-0.5 rounded-xl" style={{ background: 'var(--input-bg)', border: '1px solid var(--input-border)' }}>
+              {WARRANTY_UNITS.map(u => (
+                <button
+                  key={u.value}
+                  type="button"
+                  onClick={() => setUnidad(u.value)}
+                  className={`px-3 py-2 rounded-lg text-[11px] font-black uppercase tracking-wide transition-all ${unidad === u.value ? 'bg-red-600 text-white shadow-sm' : ''}`}
+                  style={unidad === u.value ? undefined : { color: 'var(--text-secondary)' }}
+                >
+                  {u.many}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <label className="text-[10px] font-black uppercase tracking-[0.2em]" style={{ color: 'var(--text-secondary)' }}>Qué cubre</label>
+            <span className="text-[10px] font-black" style={{ color: cubre.size ? 'var(--accent)' : 'var(--text-tertiary)' }}>{cubre.size} seleccionados</span>
+          </div>
+          <div className="space-y-4">
+            {WARRANTY_COVERAGE_GROUPS.map(group => {
+              const allOn = group.items.every(([k]) => cubre.has(k));
+              return (
+                <div key={group.title}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <p className="text-[11px] font-black" style={{ color: 'var(--text-primary)' }}>{group.title}</p>
+                    <button type="button" onClick={() => toggleGroup(group.items)} className="text-[10px] font-black uppercase tracking-wide" style={{ color: 'var(--accent)' }}>
+                      {allOn ? 'Quitar todo' : 'Marcar todo'}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                    {group.items.map(([key, label]) => {
+                      const on = cubre.has(key);
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          onClick={() => toggle(key)}
+                          className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-left transition-all active:scale-[0.98]"
+                          style={{
+                            background: on ? 'var(--accent-soft)' : 'var(--input-bg)',
+                            border: `1px solid ${on ? 'var(--accent)' : 'var(--input-border)'}`,
+                          }}
+                        >
+                          <span className={`w-4 h-4 rounded flex items-center justify-center shrink-0 ${on ? 'bg-red-600' : ''}`} style={on ? undefined : { border: '1.5px solid var(--text-tertiary)' }}>
+                            {on && <Check size={11} className="text-white" strokeWidth={4} />}
+                          </span>
+                          <span className="text-xs font-bold" style={{ color: 'var(--text-primary)' }}>{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3 px-6 py-4" style={{ borderTop: '1px solid var(--border-glass)' }}>
+        <button type="button" onClick={onClose} disabled={saving} className="px-4 py-3 text-xs font-black uppercase tracking-wide disabled:opacity-40" style={{ color: 'var(--text-secondary)' }}>Cancelar</button>
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black uppercase tracking-widest text-white bg-red-600 hover:bg-red-700 transition-all active:scale-[0.98] disabled:opacity-50"
+        >
+          {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+          {initial ? 'Guardar cambios' : 'Crear garantía'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// Selector: lista de garantías guardadas + crear/editar/borrar.
+const WarrantyPickerModal = ({ dealerId, selectedId, onSelect, onClose, showToast }) => {
+  const [warranties, setWarranties] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(null); // null = lista | {} = nueva | garantía = editar
+
+  const load = useCallback(async () => {
+    if (!dealerId) { setLoading(false); return; }
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('dealer_garantias')
+      .select('*')
+      .eq('dealer_id', dealerId)
+      .order('created_at', { ascending: true });
+    if (error) console.error('Error cargando garantías:', error);
+    else setWarranties(data || []);
+    setLoading(false);
+  }, [dealerId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleDelete = async (w) => {
+    if (!window.confirm(`¿Eliminar "${w.titulo}"? Los vehículos que la tengan asignada quedarán sin garantía.`)) return;
+    const { error } = await supabase.from('dealer_garantias').delete().eq('id', w.id);
+    if (error) {
+      console.error('Error eliminando garantía:', error);
+      return showToast('No se pudo eliminar la garantía.', 'error');
+    }
+    if (w.id === selectedId) onSelect(null);
+    showToast('Garantía eliminada.');
+    load();
+  };
+
+  const editingNew = editing !== null && !editing.id;
+
+  return (
+    <div className="fixed inset-0 z-[10001] flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}>
+      <div className="w-full max-w-lg max-h-[90vh] flex flex-col rounded-3xl shadow-2xl overflow-hidden" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-glass)' }}>
+        <div className="flex items-center justify-between px-6 py-4 shrink-0" style={{ borderBottom: '1px solid var(--border-glass)' }}>
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl flex items-center justify-center bg-red-600"><ShieldCheck size={18} className="text-white" /></div>
+            <h2 className="text-sm font-black uppercase tracking-[0.15em]" style={{ color: 'var(--text-primary)' }}>
+              {editing === null ? 'Elegir garantía' : editingNew ? 'Nueva garantía' : 'Editar garantía'}
+            </h2>
+          </div>
+          <button type="button" onClick={onClose} className="p-2 rounded-xl hover:bg-black/5" style={{ color: 'var(--text-tertiary)' }}><X size={18} /></button>
+        </div>
+
+        {editing !== null ? (
+          <WarrantyEditor
+            initial={editingNew ? null : editing}
+            dealerId={dealerId}
+            onClose={() => setEditing(null)}
+            showToast={showToast}
+            onSaved={(w) => { setEditing(null); load(); onSelect(w.id); }}
+          />
+        ) : (
+          <div className="p-6 space-y-3 overflow-y-auto">
+            {loading ? (
+              <p className="text-xs font-bold text-center py-6" style={{ color: 'var(--text-tertiary)' }}>Cargando garantías...</p>
+            ) : warranties.length === 0 ? (
+              <p className="text-xs font-bold text-center py-6" style={{ color: 'var(--text-tertiary)' }}>Aún no has creado ninguna garantía.</p>
+            ) : warranties.map(w => {
+              const isSel = w.id === selectedId;
+              return (
+                <div key={w.id} className="rounded-2xl p-4" style={{ background: isSel ? 'var(--accent-soft)' : 'var(--input-bg)', border: `1px solid ${isSel ? 'var(--accent)' : 'var(--input-border)'}` }}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-black truncate" style={{ color: 'var(--text-primary)' }}>{w.titulo}</p>
+                      <p className="text-[11px] font-bold" style={{ color: 'var(--accent)' }}>{formatWarrantyTerm(w.plazo_valor, w.plazo_unidad)}</p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button type="button" onClick={() => setEditing(w)} className="p-2 rounded-lg hover:bg-black/5" style={{ color: 'var(--text-secondary)' }} title="Editar"><Edit size={14} /></button>
+                      <button type="button" onClick={() => handleDelete(w)} className="p-2 rounded-lg hover:bg-black/5" style={{ color: 'var(--text-secondary)' }} title="Eliminar"><Trash2 size={14} /></button>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1 mt-2.5">
+                    {(w.cubre || []).map(k => (
+                      <span key={k} className="px-2 py-0.5 rounded-md text-[10px] font-bold" style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border-glass)' }}>
+                        {WARRANTY_COVERAGE_LABELS[k] || k}
+                      </span>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { onSelect(w.id); onClose(); }}
+                    className={`mt-3 w-full py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all active:scale-[0.98] ${isSel ? '' : 'text-white bg-red-600 hover:bg-red-700'}`}
+                    style={isSel ? { background: 'var(--bg-elevated)', color: 'var(--accent)', border: '1px solid var(--accent)' } : undefined}
+                  >
+                    {isSel ? 'Seleccionada' : 'Usar en este vehículo'}
+                  </button>
+                </div>
+              );
+            })}
+
+            <button
+              type="button"
+              onClick={() => setEditing({})}
+              className="w-full flex items-center justify-center gap-2 py-3.5 rounded-2xl text-xs font-black uppercase tracking-widest transition-all active:scale-[0.98]"
+              style={{ border: '2px dashed var(--accent)', color: 'var(--accent)' }}
+            >
+              <Plus size={15} strokeWidth={3} /> Crear nueva garantía
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Bloque dentro de la ficha del vehículo.
+const VehicleWarrantySection = ({ dealerId, garantiaId, onChange, showToast, disabled }) => {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState(null);
+
+  // Se vuelve a leer al cerrar el selector: así un cambio hecho al editar la
+  // garantía se refleja de inmediato en la tarjeta.
+  useEffect(() => {
+    if (!garantiaId) { setCurrent(null); return; }
+    let cancelled = false;
+    supabase.from('dealer_garantias').select('*').eq('id', garantiaId).maybeSingle()
+      .then(({ data, error }) => {
+        if (error) console.error('Error cargando garantía:', error);
+        if (!cancelled) setCurrent(data || null);
+      });
+    return () => { cancelled = true; };
+  }, [garantiaId, open]);
+
+  return (
+    <div className="mt-6 rounded-2xl p-5" style={{ background: 'var(--input-bg)', border: '1px solid var(--input-border)' }}>
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div className="flex items-center gap-2">
+          <ShieldCheck size={15} className="text-red-500" />
+          <h3 className="text-[11px] font-black uppercase tracking-[0.2em]" style={{ color: 'var(--text-secondary)' }}>Garantía</h3>
+        </div>
+        {current && !disabled && (
+          <button type="button" onClick={() => onChange(null)} className="text-[10px] font-black uppercase tracking-wide hover:text-red-600" style={{ color: 'var(--text-tertiary)' }}>Quitar</button>
+        )}
+      </div>
+
+      {current ? (
+        <div className="rounded-xl p-4" style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-glass)' }}>
+          <div className="flex items-baseline justify-between gap-3">
+            <p className="text-sm font-black" style={{ color: 'var(--text-primary)' }}>{current.titulo}</p>
+            <p className="text-xs font-black shrink-0" style={{ color: 'var(--accent)' }}>{formatWarrantyTerm(current.plazo_valor, current.plazo_unidad)}</p>
+          </div>
+          <div className="flex flex-wrap gap-1 mt-2.5">
+            {(current.cubre || []).map(k => (
+              <span key={k} className="px-2 py-0.5 rounded-md text-[10px] font-bold" style={{ background: 'var(--input-bg)', color: 'var(--text-secondary)' }}>
+                {WARRANTY_COVERAGE_LABELS[k] || k}
+              </span>
+            ))}
+          </div>
+          {!disabled && (
+            <button type="button" onClick={() => setOpen(true)} className="mt-3 text-[10px] font-black uppercase tracking-wide" style={{ color: 'var(--accent)' }}>Cambiar garantía</button>
+          )}
+        </div>
+      ) : (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => setOpen(true)}
+          className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl text-xs font-black uppercase tracking-widest transition-all active:scale-[0.98] disabled:opacity-50"
+          style={{ border: '2px dashed var(--accent)', color: 'var(--accent)' }}
+        >
+          <Plus size={15} strokeWidth={3} /> Añadir garantía
+        </button>
+      )}
+
+      {open && createPortal(
+        <WarrantyPickerModal
+          dealerId={dealerId}
+          selectedId={garantiaId}
+          onSelect={onChange}
+          onClose={() => setOpen(false)}
+          showToast={showToast}
+        />,
+        document.body
+      )}
+    </div>
+  );
+};
+
+const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile, showToast }) => {
   const { t } = useI18n();
   const { selected: selectedCurrencies, getSymbol } = useCurrency();
   const [loading, setLoading] = useState(false);
@@ -658,6 +1037,8 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     ));
   }, []);
   const [savedFinancing, setSavedFinancing] = useState(null);
+  // Garantía asignada a esta unidad (dealer_garantias.id); null = sin garantía.
+  const [garantiaId, setGarantiaId] = useState(null);
   const globalInitialPct = rateConfig?.autoInitialPct ?? DEFAULT_AUTO_INITIAL_PCT;
   const hasCustomInitialPct = customInitialPct !== null && customInitialPct !== '';
   const effectiveInitialPct = hasCustomInitialPct ? Number(customInitialPct) : globalInitialPct;
@@ -769,6 +1150,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       // Si ya tiene precio guardado pero nunca se le puso inicial, asumimos que se
       // dejó vacío a propósito la vez anterior — mostrar el checkbox ya marcado.
       setLeaveInitialEmpty(!hasRealInitial && hasRealPrice);
+      setGarantiaId(initialData.garantia_id || null);
       setSavedFinancing({
         bankId: initialData.financiamiento_banco_id || null,
         term: initialData.financiamiento_plazo_meses || null,
@@ -799,6 +1181,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
       setLeaveInitialEmpty(false);
       setCustomInitialPct(null);
       setSavedFinancing(null);
+      setGarantiaId(null);
     }
   }, [initialData, isOpen]);
 
@@ -980,6 +1363,7 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
     // '' (casilla vacía al guardar sin salir del campo) cuenta como "sin % propio".
     data.porcentaje_inicial = hasCustomInitialPct ? Number(customInitialPct) : null;
     // Opción de financiamiento que la API expone como principal para los bots.
+    data.garantia_id = garantiaId || null;
     data.financiamiento_banco_id = financing.bankId || null;
     data.financiamiento_plazo_meses = financing.term || null;
     data.financiamiento_tasa_manual = (financing.manualRate === null || financing.manualRate === undefined || Number.isNaN(financing.manualRate))
@@ -1530,6 +1914,14 @@ const VehicleFormModal = ({ isOpen, onClose, onSave, initialData, userProfile })
                 getSymbol={getSymbol}
                 saved={savedFinancing}
                 onChange={handleFinancingChange}
+              />
+
+              <VehicleWarrantySection
+                dealerId={userProfile?.supabaseDealerId || userProfile?.dealerId || ''}
+                garantiaId={garantiaId}
+                onChange={setGarantiaId}
+                showToast={showToast}
+                disabled={isLocked}
               />
             </div>
 
@@ -7340,7 +7732,7 @@ const InventoryView = ({ inventory, setInventory, quotes = [], contracts = [], s
       </div>
 
       {isModalOpen && createPortal(
-        <VehicleFormModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} onSave={handleSaveWrapper} initialData={currentVehicle} userProfile={userProfile} />,
+        <VehicleFormModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} onSave={handleSaveWrapper} initialData={currentVehicle} userProfile={userProfile} showToast={showToast} />,
         document.body
       )}
       {isActionModalOpen && createPortal(
@@ -10303,6 +10695,10 @@ export default function CarbotApp() {
         // dealer (y el recálculo masivo de Ajustes puede tocarlo); un número lo
         // deja fuera de ese recálculo. Se respeta null explícito para poder
         // volver a atarlo al global.
+        // Garantía de la unidad; null explícito la quita.
+        garantia_id: Object.prototype.hasOwnProperty.call(vehicleData, 'garantia_id')
+          ? (vehicleData.garantia_id || null)
+          : (existingRecord?.garantia_id ?? null),
         // Financiamiento preferido de la unidad; null explícito lo desvincula.
         financiamiento_banco_id: Object.prototype.hasOwnProperty.call(vehicleData, 'financiamiento_banco_id')
           ? (vehicleData.financiamiento_banco_id || null)
