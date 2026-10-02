@@ -137,6 +137,40 @@ const calcMonthlyPayment = (principal, annualRatePct, months) => {
 // por el máximo real de cada banco antes de publicarse.
 const FINANCING_TERMS = [6, 12, 24, 36, 48, 60, 72];
 
+// Garantías (tabla dealer_garantias). `cubre` guarda claves estables; las
+// etiquetas viven aquí y en el panel (src/App.jsx, WARRANTY_COVERAGE_GROUPS).
+// Una clave desconocida se publica tal cual en vez de perderse.
+const WARRANTY_LABELS = {
+  motor: 'Motor', transmision: 'Transmisión', caja_transferencia: 'Caja de transferencia',
+  diferencial: 'Diferencial / tracción', turbo: 'Turbo', enfriamiento: 'Sistema de enfriamiento',
+  combustible: 'Sistema de combustible', escape: 'Escape y catalizador',
+  suspension: 'Suspensión', direccion: 'Dirección', frenos: 'Frenos',
+  sistema_electrico: 'Sistema eléctrico', bateria: 'Batería', alternador: 'Alternador',
+  arranque: 'Motor de arranque', computadora: 'Computadora (ECU)', sensores: 'Sensores',
+  aire_acondicionado: 'Aire acondicionado', vidrios_electricos: 'Vidrios eléctricos',
+  baul_electrico: 'Baúl eléctrico', camara: 'Cámara', pantalla: 'Pantalla / CarPlay',
+  techo: 'Techo / sunroof', llave: 'Llave / push button',
+};
+const WARRANTY_UNITS = { dias: ['día', 'días'], meses: ['mes', 'meses'], anos: ['año', 'años'] };
+
+// El título de la garantía lo escribe el dealer y se inyecta en HTML: se escapa.
+const escapeHtml = (str) => String(str ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+// Fila de dealer_garantias -> forma pública (null si no hay garantía).
+const formatWarranty = (w) => {
+  if (!w) return null;
+  const unit = WARRANTY_UNITS[w.plazo_unidad] || [w.plazo_unidad, w.plazo_unidad];
+  return {
+    titulo: w.titulo,
+    plazo_valor: w.plazo_valor,
+    plazo_unidad: w.plazo_unidad,
+    plazo_texto: `${w.plazo_valor} ${Number(w.plazo_valor) === 1 ? unit[0] : unit[1]}`,
+    cubre: (w.cubre || []).map(k => WARRANTY_LABELS[k] || k),
+  };
+};
+
 // Construye el link de WhatsApp del dealer. Si el dealer configuró un link
 // completo (wa.me/api.whatsapp.com), se reescribe con el mensaje del vehículo;
 // si es otro tipo de link (ej. invitación de grupo), se usa tal cual.
@@ -1005,6 +1039,23 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
         const waLinkDetail = buildWaLink(dealerPhone, dealerWaLink, waMessageDetail);
 
         // --- FINANCIAMIENTO: bancos reales configurados por el dealer ---
+        // --- GARANTÍA asignada a la unidad ---
+        let warranty = null;
+        const warrantyId = raw.garantia_id || v.garantia_id;
+        if (warrantyId) {
+          try {
+            const { data: wData, error: wErr } = await supabase
+              .from('dealer_garantias')
+              .select('titulo, plazo_valor, plazo_unidad, cubre')
+              .eq('id', warrantyId)
+              .maybeSingle();
+            if (wErr) console.error('❌ Error consultando garantía:', wErr);
+            warranty = formatWarranty(wData);
+          } catch (wErr) {
+            console.error('❌ Fallo consultando garantía:', wErr);
+          }
+        }
+
         let financingBanks = [];
         if (dealerUuid) {
           try {
@@ -1516,6 +1567,22 @@ exports.inventarioIA = onRequest({ cors: true }, async (req, res) => {
                     ${v.traccion ? `<span class="spec-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/></svg>${String(v.traccion).toUpperCase()}</span>` : ''}
                     ${v.combustible ? `<span class="spec-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>${String(v.combustible).toUpperCase()}</span>` : ''}
                   </div>
+
+                  ${warranty ? `
+                  <!-- Garantía -->
+                  <div style="margin-top:18px;padding:16px 18px;border-radius:18px;background:var(--accent-light);border:1px solid var(--accent-border);">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+                      <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20" style="flex-shrink:0;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+                        <span style="font-size:0.85rem;font-weight:800;color:var(--text-primary);">${escapeHtml(warranty.titulo)}</span>
+                      </div>
+                      <span style="font-size:0.8rem;font-weight:800;color:var(--accent);">${escapeHtml(warranty.plazo_texto)}</span>
+                    </div>
+                    ${warranty.cubre.length > 0 ? `
+                    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:12px;">
+                      ${warranty.cubre.map(c => `<span style="font-size:0.72rem;font-weight:600;color:var(--text-secondary);background:rgba(255,255,255,0.7);border:1px solid var(--accent-border);padding:4px 10px;border-radius:999px;">${escapeHtml(c)}</span>`).join('')}
+                    </div>` : ''}
+                  </div>` : ''}
                 </div>
               </div>
 
@@ -2953,9 +3020,20 @@ exports.inventorySearch = onRequest({ cors: true, secrets: [supabaseServiceKey] 
       };
     };
 
+    // ── GARANTÍAS ───────────────────────────────────────────────────
+    // El vehículo solo guarda garantia_id; se resuelve a título, plazo y
+    // componentes cubiertos para que el bot pueda responder "¿qué cubre?".
+    const { data: warrantyRows, error: warrantyErr } = await supabaseAdmin
+      .from('dealer_garantias')
+      .select('id, titulo, plazo_valor, plazo_unidad, cubre')
+      .eq('dealer_id', dealerId);
+    if (warrantyErr) throw warrantyErr;
+    const warrantyById = new Map((warrantyRows || []).map(w => [w.id, w]));
+
     const result = vehiculos.map(v => {
       const out = { ...v };
       delete out.deleted_at;
+      out.garantia = formatWarranty(warrantyById.get(v.garantia_id));
       // Se aplica DESPUÉS del spread para que el plazo efectivo sustituya al
       // valor crudo de la fila (null cuando el dealer no eligió plazo).
       Object.assign(out, resolveFinancing(v) || {});
